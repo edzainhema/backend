@@ -6,6 +6,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from django.contrib.auth.hashers import make_password
+from .models import Media
+from .serializers import MediaSerializer
 
 # JWT
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -55,6 +57,31 @@ def login_user(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def profile(request):
-    return Response({"username": request.user.username})
+	media_qs = Media.objects.filter(user=request.user)
+	serializer = MediaSerializer(media_qs, many=True, context={'request': request})
+	
+	return Response({
+		"username": request.user.username,
+		"media": serializer.data
+	})
+	
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def upload_media(request):
+    uploaded_file = request.FILES.get('file')
+
+    if not uploaded_file:
+        return Response({"error": "No file provided"}, status=400)
+
+    media_item = Media.objects.create(
+        user=request.user,
+        file=uploaded_file
+    )
+
+    return Response({
+        "message": "File uploaded successfully",
+        "file_url": request.build_absolute_uri(media_item.file.url)
+    })
+
 
 
