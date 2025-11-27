@@ -8,9 +8,9 @@ class MediaSerializer(serializers.ModelSerializer):
 		model = Media
 		fields = ['id', 'user', 'file', 'file_url', 'uploaded_at']
 	
-		def get_file_url(self, obj):
-			request = self.context.get('request')
-			if request:
-				return request.build_absolute_uri(obj.file.url)
-			return obj.file.url
+	def get_file_url(self, obj):
+		request = self.context.get('request')
+		if request:
+			return request.build_absolute_uri(obj.file.url)
+		return obj.file.url
 	
