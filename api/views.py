@@ -68,20 +68,23 @@ def profile(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def upload_media(request):
-    uploaded_file = request.FILES.get('file')
-
-    if not uploaded_file:
-        return Response({"error": "No file provided"}, status=400)
-
-    media_item = Media.objects.create(
-        user=request.user,
-        file=uploaded_file
-    )
-
-    return Response({
-        "message": "File uploaded successfully",
-        "file_url": request.build_absolute_uri(media_item.file.url)
-    })
+	print('\n\nAttempting\n\n')
+	uploaded_file = request.FILES.get('file')
+	
+	if not uploaded_file:
+		return Response({"error": "No file provided"}, status=400)
+	
+	media_item = Media.objects.create(
+		user=request.user,
+		file=uploaded_file
+	)
+	
+	print('\n\nThe media has succesfully been uploaded\n\n')
+	
+	return Response({
+		"message": "File uploaded successfully",
+		"file_url": request.build_absolute_uri(media_item.file.url)
+	})
 
 
 
