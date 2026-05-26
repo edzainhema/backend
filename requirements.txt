@@ -1,7 +1,71 @@
-asgiref==3.10.0
+# Backend Python dependencies.
+#
+# Direct dependencies are pinned to the exact versions that the project was
+# developed and tested against (taken from the working virtualenv). pip resolves
+# the compatible transitive dependencies (twisted/autobahn for daphne, the
+# google-* / grpcio stack for firebase-admin, etc.).
+#
+# Regenerate a fully-locked snapshot any time with:  pip freeze > requirements.lock
+#
+# SYSTEM PREREQUISITE: ffmpeg-python is only a thin wrapper — the `ffmpeg`
+# binary must be installed on the host (e.g. `apt-get install -y ffmpeg`).
+# Media upload processing in api/services/media_processing.py will fail at
+# runtime without it.
+
+# --- Core web framework / API ---
 Django==5.2.8
 djangorestframework==3.16.1
-djangorestframework_simplejwt==5.5.1
-PyJWT==2.10.1
+djangorestframework-simplejwt==5.5.1
+PyJWT==2.10.1                 # required by simplejwt; pinned explicitly
+
+# --- Django runtime deps (pinned for reproducibility) ---
+asgiref==3.10.0
 sqlparse==0.5.3
 tzdata==2025.2
+
+# --- Database driver (PostgreSQL) ---
+# Django's 'postgresql' backend (see settings.py DATABASES / INF-1) uses this.
+# psycopg v3 is the current driver and is auto-detected by Django 4.2+/5.x.
+psycopg[binary]==3.2.3
+
+# --- ASGI / WebSockets (api/consumers.py, real-time messaging) ---
+channels==4.3.2
+channels-redis==4.2.1         # cross-process channel layer; used when REDIS_URL is set (see settings.py CHANNEL_LAYERS)
+daphne==4.2.1                 # ASGI server (also serves the WebSocket layer)
+# --- Cache / Redis fast-paths (django-redis) ---
+# Backs CACHES["default"] in settings.py. Activates the feed impression
+# buffer (api/feed/impressions.py), the cross-process seen-set
+# (api/feed/seen.py + drain_impressions), and all cross-worker shared cache
+# state when REDIS_URL (or REDIS_CACHE_URL) is set. See INF-2.
+django-redis==5.4.0
+
+# --- Background task queue (Celery on Redis) ---
+# Gives deferrable per-event work a home off the request / WebSocket path:
+# push fan-out (SY-2 / WS-3) and media transcoding (SY-1). Broker is
+# CELERY_BROKER_URL or REDIS_URL (see settings.py); the [redis] extra pulls in
+# the redis client kombu needs. Run a worker with:  celery -A backend worker
+celery[redis]==5.4.0
+
+# --- WSGI HTTP server (production) ---
+gunicorn==23.0.0
+
+# --- Push notifications (backend/firebase.py imports this at startup) ---
+firebase-admin==7.1.0
+
+# --- Media processing (api/services/media_processing.py) ---
+Pillow==12.0.0
+ffmpeg-python==0.2.0          # needs the `ffmpeg` system binary (see note above)
+
+# ----------------------------------------------------------------------------
+# channels-redis (above) is now wired: settings.py uses RedisChannelLayer
+# whenever REDIS_URL is set, so cross-process WebSocket fan-out (DMs / typing /
+# read receipts / live edit-delete) works under multiple workers. Locally,
+# with REDIS_URL unset, it falls back to the in-memory layer and channels-redis
+# stays installed-but-unused.
+#
+# Both Redis-backed paths are now wired:
+#   * channels-redis -> CHANNEL_LAYERS  (cross-process WebSocket fan-out)
+#   * django-redis    -> CACHES["default"]  (feed impression buffer, the
+#     cross-process seen-set + drain_impressions, and all cross-worker shared
+#     cache state). Both activate when REDIS_URL (or REDIS_CACHE_URL) is set
+#     and fall back to in-process equivalents for local dev. See INF-1/INF-2.

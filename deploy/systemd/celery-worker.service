@@ -1,0 +1,31 @@
+# systemd unit for the Celery worker (background tasks — BACKEND_SCALING_AUDIT.md
+# INF-5: push fan-out SY-2/WS-3, media transcoding SY-1). Unlike the cron timers
+# this is a long-running service.
+#
+# Install:
+#   1. Edit WorkingDirectory / ExecStart / User / Environment below.
+#   2. sudo cp backend/deploy/systemd/celery-worker.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now celery-worker
+# Logs: journalctl -u celery-worker   (and backend/logs/celery_worker.log)
+
+[Unit]
+Description=Celery worker (push fan-out, media processing — INF-5)
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=here-social
+Group=here-social
+WorkingDirectory=/srv/here-social/backend
+# REDIS_URL (or CELERY_BROKER_URL) MUST be set for the worker to do anything;
+# point it at the same Redis the app uses (a dedicated DB index is cleanest).
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+ExecStart=/usr/bin/bash /srv/here-social/backend/scripts/run_celery_worker.sh
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

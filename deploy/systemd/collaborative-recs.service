@@ -1,0 +1,24 @@
+# systemd alternative to the cron entry (deploy/cron/collaborative-recs.cron).
+# Use this if the host is managed with systemd — you get journald logging and
+# clean run-at-most-once-at-a-time semantics for free.
+#
+# Install:
+#   1. Edit WorkingDirectory / ExecStart / User below for your deployment.
+#   2. Copy both unit files into /etc/systemd/system/:
+#        sudo cp backend/deploy/systemd/collaborative-recs.{service,timer} /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now collaborative-recs.timer
+#
+# Check it:  systemctl list-timers collaborative-recs.timer
+# Logs:      journalctl -u collaborative-recs.service
+
+[Unit]
+Description=Collaborative-filtering recompute (people-like-you feed rail, B3)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=here-social
+Group=here-social
+WorkingDirectory=/srv/here-social/backend
+ExecStart=/usr/bin/bash /srv/here-social/backend/scripts/run_collaborative_recs.sh

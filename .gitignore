@@ -1,7 +1,32 @@
+# Python
 venv/
-db.sqlite3
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.swp
+
+# Django
+db.sqlite3
+*.log
+
+# Firebase / secrets (CRITICAL)
+firebase/*.json
+*.pem
+*.key
+.env
+
+# Media uploads
+uploads/
+media/
+
+# Node / React Native
+node_modules/
+android/app/build/
+ios/build/
+
+# OS / editor junk
+.DS_Store
+.vscode/
+.idea/
+db.sqlite3.bak

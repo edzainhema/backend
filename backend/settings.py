@@ -12,18 +12,35 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 import os
+from datetime import timedelta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Load an optional, git-ignored .env file (BASE_DIR/.env) into the process
+# environment so secrets like GOOGLE_PLACES_API_KEY can live next to the code
+# without being committed. Real environment variables take precedence, so a
+# value exported by the deploy environment always wins over the .env file.
+_env_file = BASE_DIR / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _key, _, _val = _line.partition("=")
+        os.environ.setdefault(_key.strip(), _val.strip().strip('"').strip("'"))
+
+import backend.firebase
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-
 # Allow large uploads (optional)
-DATA_UPLOAD_MAX_MEMORY_SIZE = 52428800  # 50MB
-FILE_UPLOAD_MAX_MEMORY_SIZE = 52428800  # 50MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 524288000   # 500MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 524288000   # 500MB
+FILE_UPLOAD_HANDLERS = [
+    'django.core.files.uploadhandler.TemporaryFileUploadHandler',
+]
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
@@ -36,6 +53,12 @@ DEBUG = True
 
 ALLOWED_HOSTS = ['*']
 
+# ✅ Used by consumers.py to build absolute avatar URLs over WebSocket
+# (WebSocket consumers have no request object, so they can't call
+#  request.build_absolute_uri). Update this to your server's public URL
+# before deploying to production. No trailing slash.
+SITE_URL = 'http://localhost:8000'
+
 
 # Application definition
 
@@ -46,17 +69,133 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-	'rest_framework',
-	'rest_framework_simplejwt',
-	'api',
+    'rest_framework',
+    'rest_framework_simplejwt',
+    'channels',
+    'api',
 ]
 
-REST_FRAMEWORK = {
-	'DEFAULT_AUTHENTICATION_CLASSES': (
-		'rest_framework_simplejwt.authentication.JWTAuthentication',
-	),
-}
+ASGI_APPLICATION = "backend.asgi.application"
 
+# Channel layer — backs every WebSocket broadcast (DM + page chat, live message
+# / edit / delete, typing, read receipts, conversation rename). The in-memory
+# layer only delivers within ONE process, so under multiple workers (any real
+# production deploy) cross-process group_send events are silently dropped and
+# clients on other workers never see them ("messages don't arrive until I
+# reopen the chat"). So: use channels-redis whenever a Redis URL is available,
+# and fall back to the in-memory layer only for local single-process dev. See
+# BACKEND_SCALING_AUDIT.md INF-3 / WS-1.
+#
+# Set REDIS_URL (e.g. "redis://127.0.0.1:6379/0") -- the shared default for the
+# cache (INF-2), this channel layer, and Celery (INF-5). Optionally set
+# REDIS_CHANNEL_URL to a dedicated Redis DB index (e.g. .../3) to keep pub/sub
+# group traffic off the cache keyspace. Requires the channels-redis package
+# (pinned in requirements.txt). The production guard below refuses to boot on
+# the in-memory layer when DEBUG is off.
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+REDIS_CHANNEL_URL = os.environ.get("REDIS_CHANNEL_URL", "").strip() or REDIS_URL
+if REDIS_CHANNEL_URL:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [REDIS_CHANNEL_URL],
+                # Per-channel buffer before group_send raises ChannelFull. The
+                # default (100) is tight for a busy room with a momentarily slow
+                # client; 1500 gives headroom. A client that still misses a frame
+                # reconnects and catches up over REST (useChatRoom / usePageChat),
+                # so this is purely a smoothing buffer, not a delivery guarantee.
+                "capacity": 1500,
+                # Undelivered messages expire after 60s: a disconnected client
+                # isn't coming back for THIS frame, it re-syncs via REST.
+                "expiry": 60,
+            },
+        }
+    }
+else:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels.layers.InMemoryChannelLayer",
+        }
+    }
+
+# Fail fast in production: the in-memory channel layer only delivers within a
+# single process, so a multi-worker production deploy on it silently drops
+# cross-process broadcasts (chat / typing / read receipts / edits / renames).
+# Refuse to boot on it when DEBUG is off, so a missing REDIS_URL is caught at
+# startup instead of surfacing as "messages don't arrive" in the field
+# (BACKEND_SCALING_AUDIT.md INF-3). Single-process local dev (DEBUG=True,
+# REDIS_URL unset) is unaffected.
+if not DEBUG and CHANNEL_LAYERS["default"]["BACKEND"].endswith("InMemoryChannelLayer"):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        "REDIS_URL is required when DEBUG=False: the in-memory channel layer "
+        "only delivers WebSocket events within one process, so multi-worker "
+        "production deploys silently drop cross-process broadcasts (chat, "
+        "typing, read receipts, edits, renames). Set REDIS_URL to a Redis "
+        "instance (channels-redis is already installed)."
+    )
+
+# ----------------------------------------------------------------------------
+# Cache — backs the feed's Redis fast-paths and all cross-worker shared state.
+#
+# Without a Redis cache Django uses a per-process LocMemCache and several
+# deliberate optimisations silently degrade to their slow path:
+#   - api/feed/impressions.py and api/feed/seen.py call get_redis_connection(
+#     "default"), which reads THIS config (not REDIS_URL). On LocMemCache that
+#     raises, so feed impressions are written synchronously on every /feed/
+#     render and the seen-post dedup becomes per-process (a post served by one
+#     worker reappears via another).
+#   - build_feed_context, explore/suggested scores, and the unread-count cache
+#     become per-process, collapsing hit rates and breaking cross-worker
+#     invalidation on follow / block / notification.
+# See BACKEND_SCALING_AUDIT.md INF-2.
+#
+# So: use Redis whenever a URL is available (REDIS_CACHE_URL, else the same
+# REDIS_URL the channel layer uses) and fall back to LocMemCache for local
+# single-process dev so a fresh checkout needs no infra. Requires django-redis
+# (pinned in requirements.txt).
+#
+# IGNORE_EXCEPTIONS keeps a Redis blip from 500-ing every cached endpoint (a
+# returned miss is the correct degradation for a cache); the socket timeouts
+# stop a hung Redis from pinning request workers; KEY_PREFIX namespaces cache
+# keys so they safely share a Redis DB with the channel layer (channels-redis
+# uses its own "asgi:" keyspace) and with the feed's raw "feed:*" keys.
+# ----------------------------------------------------------------------------
+REDIS_CACHE_URL = os.environ.get("REDIS_CACHE_URL", "").strip() or REDIS_URL
+if REDIS_CACHE_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": REDIS_CACHE_URL,
+            "KEY_PREFIX": "here",
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+                # A Redis outage degrades to a cache miss instead of a 500.
+                "IGNORE_EXCEPTIONS": True,
+                "SOCKET_CONNECT_TIMEOUT": 3,
+                "SOCKET_TIMEOUT": 3,
+            },
+        }
+    }
+    # Log (don't silently swallow) any error IGNORE_EXCEPTIONS suppresses.
+    DJANGO_REDIS_LOG_IGNORED_EXCEPTIONS = True
+else:
+    # Local-dev fallback ONLY (single process). The feed Redis fast-paths
+    # no-op here and fall back to their synchronous / in-process equivalents
+    # by design — never run multiple workers against this backend.
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "here-locmem",
+        }
+    }
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -64,6 +203,12 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    # ✅ Updates UserProfile.last_seen on every authenticated HTTP request,
+    # which drives the is_online presence indicator across the app.
+    'api.middleware.UpdateLastSeenMiddleware',
+    # Captures the client's X-Session-Id header into request-local state so
+    # activity rows are tagged with their session (C3).
+    'api.middleware.SessionIdMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -91,12 +236,94 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+# PostgreSQL in every real deployment. This app is write-heavy and WebSocket-
+# backed (every like / follow / message / read-receipt / last_seen / feed
+# impression is a write), and SQLite serialises ALL writes behind one
+# process-wide lock — under concurrency those writes queue and p95 latency +
+# "database is locked" errors climb fast. Postgres gives row-level write
+# concurrency and is the prerequisite for the pg_trgm search indexes the audit
+# calls for. See BACKEND_SCALING_AUDIT.md INF-1.
+#
+# Configuration is environment-driven, mirroring the REDIS_URL pattern above:
+#
+#   1. DATABASE_URL  — a single libpq-style URL (preferred; 12-factor), e.g.
+#        postgres://user:pass@host:5432/dbname
+#   2. POSTGRES_*    — discrete vars (POSTGRES_DB required, others defaulted)
+#   3. neither set   — fall back to a local SQLite file so a fresh checkout
+#        still runs `manage.py runserver` with zero infra. This path is for
+#        SINGLE-PROCESS LOCAL DEV ONLY and is refused when DEBUG is off (see the
+#        production guard below), so prod can never silently run on SQLite.
+#
+# Requires a PostgreSQL driver (psycopg v3, or psycopg2) — pinned in
+# requirements.txt. Django's 'postgresql' backend auto-detects whichever is
+# installed.
+from urllib.parse import unquote as _unquote, urlparse as _urlparse
+
+
+def _postgres_config_from_url(url):
+    """Parse a postgres:// URL into a Django DATABASES entry. Stdlib only, so
+    we don't add a dj-database-url dependency for a few lines of parsing."""
+    p = _urlparse(url)
+    return {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': (p.path or '').lstrip('/'),
+        'USER': _unquote(p.username or ''),
+        'PASSWORD': _unquote(p.password or ''),
+        'HOST': p.hostname or '',
+        'PORT': str(p.port) if p.port else '',
     }
-}
+
+
+_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if _DATABASE_URL:
+    DATABASES = {'default': _postgres_config_from_url(_DATABASE_URL)}
+elif os.environ.get("POSTGRES_DB", "").strip():
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ['POSTGRES_DB'].strip(),
+            'USER': os.environ.get('POSTGRES_USER', 'postgres'),
+            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
+            'HOST': os.environ.get('POSTGRES_HOST', '127.0.0.1'),
+            'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+        }
+    }
+else:
+    # Local-dev fallback ONLY — never for production (see guard below).
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+
+# Connection handling for the Postgres path. CONN_MAX_AGE keeps a connection
+# alive across requests (drops a TCP+auth round trip per request);
+# CONN_HEALTH_CHECKS (Django 4.1+) revalidates a pooled connection before reuse
+# so a socket the server recycled doesn't surface as an InterfaceError 500;
+# connect_timeout bounds how long a request blocks when the DB is unreachable.
+# Attached only on Postgres so the SQLite fallback isn't handed libpq OPTIONS.
+_default_db = DATABASES['default']
+if _default_db['ENGINE'].endswith('postgresql'):
+    _default_db['CONN_MAX_AGE'] = int(os.environ.get('DB_CONN_MAX_AGE', '60'))
+    _default_db['CONN_HEALTH_CHECKS'] = True
+    _db_options = _default_db.setdefault('OPTIONS', {})
+    _db_options.setdefault('connect_timeout', 10)
+    # Set DB_SSLMODE=require (or verify-full) for a managed / remote Postgres.
+    _sslmode = os.environ.get('DB_SSLMODE', '').strip()
+    if _sslmode:
+        _db_options['sslmode'] = _sslmode
+
+# Production guard: refuse to boot on the SQLite dev fallback when DEBUG is
+# off, so a missing DATABASE_URL in production fails fast and loudly instead
+# of silently serving from a single-writer file (BACKEND_SCALING_AUDIT.md INF-1).
+if not DEBUG and _default_db['ENGINE'].endswith('sqlite3'):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        'Refusing to run on SQLite with DEBUG=False. Set DATABASE_URL (or the '
+        'POSTGRES_* environment variables) to point at a PostgreSQL instance.'
+    )
 
 
 # Password validation
@@ -139,3 +366,102 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=60),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': False,  # set True only if you add simplejwt blacklist app
+}
+
+
+# ----------------------------------------------------------------------------
+# Google OAuth — audience allowlist for /auth/social/.
+#
+# api/views.py:_verify_google_id_token reads GOOGLE_OAUTH_CLIENT_IDS and
+# rejects any incoming Google id_token whose `aud` claim is not in this list.
+# Without it, the verification still checks Google's signature but accepts
+# tokens minted for *any* client — a low-stakes but unnecessary risk.
+#
+# Tokens minted via @react-native-google-signin/google-signin always have
+# `aud` set to the *web* client ID (because we configured webClientId in
+# socialAuth.ts), so the web entry is the one that matters in practice.
+# The iOS and Android client IDs are included defensively in case a future
+# flow ever forwards a platform-native token directly to the backend.
+#
+# These IDs are public — they're embedded in the mobile binaries — so it's
+# fine to commit them. They're not secrets; they're identifiers.
+# ----------------------------------------------------------------------------
+GOOGLE_OAUTH_CLIENT_IDS = [
+    # Web client (Firebase auto-created, project here-d43c4)
+    '1057942535812-ee4096nmm3lu1b75gpvesk9pbcuo8ug3.apps.googleusercontent.com',
+    # iOS client (bundle id com.heresocial.frontend)
+    '1057942535812-8a680bbjjfgl6l8s93gvn62firhrj97m.apps.googleusercontent.com',
+    # Android client (package com.heresocial.frontend, debug SHA-1)
+    '1057942535812-v9vvpcd0jg5jg3tmo8u22f9fj92o1vcf.apps.googleusercontent.com',
+]
+
+
+# ----------------------------------------------------------------------------
+# Google Places — server-side key for the location autocomplete proxy.
+#
+# api/views/pages/location.py uses this key to call the Places API (New)
+# Autocomplete + Place Details endpoints on the client's behalf. Unlike the
+# OAuth client IDs above, this IS a secret: it must NOT ship in the mobile
+# binary, which is exactly why the app talks to our /pages/location/* proxy
+# endpoints instead of calling Google directly.
+#
+# Set it via the environment in every deployment, e.g.
+#     export GOOGLE_PLACES_API_KEY="AIza...your-key..."
+# Leaving it blank disables the autocomplete proxy (the endpoints return 503),
+# and the LocationModal silently falls back to plain free-text entry.
+#
+# In Google Cloud Console: create an API key and enable "Places API (New)"
+# (the legacy "Places API" was frozen in March 2025 and can't be enabled by
+# new projects). Restrict the key to Places API (New) and, ideally, to your
+# server's IP. See SETUP_GOOGLE_PLACES.md in the repo root.
+# ----------------------------------------------------------------------------
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+
+
+# ----------------------------------------------------------------------------
+# Celery — background task queue for deferrable per-event work: push fan-out
+# (SY-2 / WS-3) and media transcoding (SY-1). The app lives in backend/celery.py
+# and is loaded by backend/__init__.py; tasks live in api/tasks.py. See
+# BACKEND_SCALING_AUDIT.md INF-5.
+#
+# Broker: CELERY_BROKER_URL, else REDIS_URL (same Redis as the cache / channel
+# layer — use a dedicated DB index in prod, e.g. redis://host:6379/2). When
+# NEITHER is set the queue runs EAGER: .delay() executes inline, in-process,
+# matching today's synchronous behaviour, so adopting the queue is non-breaking.
+#
+# Results are ignored by default (fire-and-forget jobs); set
+# CELERY_RESULT_BACKEND only if you later need to await results.
+# ----------------------------------------------------------------------------
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "").strip() or REDIS_URL
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "").strip() or None
+CELERY_TASK_IGNORE_RESULT = CELERY_RESULT_BACKEND is None
+
+# No broker (local dev / tests): run tasks inline so .delay() still works and
+# nothing is silently queued-but-never-run.
+CELERY_TASK_ALWAYS_EAGER = not bool(CELERY_BROKER_URL)
+CELERY_TASK_EAGER_PROPAGATES = True   # surface task errors to the caller when eager
+
+# JSON only — never unpickle task payloads off the broker.
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_ENABLE_UTC = True
+
+# Reliability / fairness: ack a job only after it completes, so a worker crash
+# re-queues it rather than dropping it (at-least-once — keep tasks idempotent);
+# prefetch 1 so a long media job doesn't hog a batch of queued pushes.
+CELERY_TASK_ACKS_LATE = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+# Time limits so a hung task (e.g. a stuck FFmpeg transcode) can't run forever.
+CELERY_TASK_SOFT_TIME_LIMIT = int(os.environ.get("CELERY_TASK_SOFT_TIME_LIMIT", "300"))
+CELERY_TASK_TIME_LIMIT = int(os.environ.get("CELERY_TASK_TIME_LIMIT", "360"))

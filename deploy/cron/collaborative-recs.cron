@@ -1,0 +1,62 @@
+# Nightly collaborative-filtering recompute for the "people like you" feed
+# rail (ACTIVITY_AND_FEED_AUDIT.md item B3).
+#
+# This is the ONE operational step that turns the rail on. Until it runs, the
+# RecommendedAuthor table is empty, the rail returns nothing, and the feed
+# behaves exactly as before (the slot falls back to the other rails).
+#
+# ── Install (Linux cron) ─────────────────────────────────────────────────
+# Replace the path below with your deployment path, then load it under the
+# user that owns the app (so file/venv permissions match):
+#
+#     # one-off seed so you don't wait until tonight:
+#     bash /srv/here-social/backend/scripts/run_collaborative_recs.sh
+#
+#     # then install the schedule:
+#     ( crontab -l 2>/dev/null; \
+#       echo '17 3 * * * /usr/bin/bash /srv/here-social/backend/scripts/run_collaborative_recs.sh' \
+#     ) | crontab -
+#
+# Verify with:  crontab -l
+#
+# 03:17 keeps the job in the low-traffic window; the odd minute avoids the
+# top-of-hour thundering herd. Adjust the time/path to your environment.
+# Calling the wrapper via `bash` means the script doesn't need the +x bit.
+#
+17 3 * * * /usr/bin/bash /srv/here-social/backend/scripts/run_collaborative_recs.sh
+
+# Nightly taste-profile precompute for the home feed's activity rail
+# (ACTIVITY_AND_FEED_AUDIT.md item C4). Moves the expensive 30-day Activity
+# scan off the request path — the feed then reads a precomputed row. Runs a
+# few minutes ahead of the collaborative job; the two are independent, so the
+# order isn't critical. Seed once on deploy with:
+#     bash /srv/here-social/backend/scripts/run_affinity_profiles.sh
+9 3 * * * /usr/bin/bash /srv/here-social/backend/scripts/run_affinity_profiles.sh
+
+# Nightly close-friends precompute for the home feed's friend-network rail
+# (BACKEND_SCALING_AUDIT.md item UB-1). Moves the expensive 30-day DM / tag /
+# comment / like relationship scan off the request path -- the feed then reads
+# a precomputed UserCloseFriends row. Independent of the other jobs; 03:13 keeps
+# it in the low-traffic window. Safe before/without it: the read path falls back
+# to a bounded on-demand compute and an empty set just means "no close-friend
+# boost". Seed once on deploy with:
+#     bash /srv/here-social/backend/scripts/run_close_friends.sh
+13 3 * * * /usr/bin/bash /srv/here-social/backend/scripts/run_close_friends.sh
+
+# Drain buffered feed impressions from Redis into the DB, every minute
+# (ACTIVITY_AND_FEED_AUDIT.md item C1). Feed renders push impressions to a
+# Redis buffer instead of writing them on the request path; this flushes them.
+# Unlike the nightly jobs this runs continuously — it's the worker for the
+# impression queue. If it stops, the buffer caps and renders self-heal back to
+# synchronous writes, so impressions are never lost (just written on-path until
+# the drain resumes). flock in the wrapper prevents overlapping runs.
+* * * * * /usr/bin/bash /srv/here-social/backend/scripts/run_drain_impressions.sh
+
+# Recompute trending hashtags every 5 minutes (ACTIVITY_AND_FEED_AUDIT.md item
+# D2). A rolling 15-minute count of new posts per hashtag; the feed's activity
+# rail amplifies a viewer's affinity for a tag while it's trending. Cheap (one
+# aggregate query, no per-user work). Safe before/without it: the rail treats a
+# missing map as "no boost", and the cached map expires on its own if this
+# stops, so the feed reverts to baseline automatically. Seed once on deploy:
+#     bash /srv/here-social/backend/scripts/run_trending_hashtags.sh
+*/5 * * * * /usr/bin/bash /srv/here-social/backend/scripts/run_trending_hashtags.sh

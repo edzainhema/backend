@@ -1,0 +1,17 @@
+# Timer for collaborative-recs.service — fires the nightly recompute.
+# See collaborative-recs.service for install instructions.
+
+[Unit]
+Description=Nightly schedule for the collaborative-filtering recompute (B3)
+
+[Timer]
+# 03:17 local time daily, matching the cron entry. OnCalendar is forgiving:
+# Persistent=true means a missed run (host was off at 03:17) fires at the
+# next boot instead of being skipped.
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+# Spread the start by up to 5 min so a fleet of hosts doesn't all fire at once.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
