@@ -17,8 +17,8 @@ firebase/*.json
 .env
 
 # Media uploads
-uploads/
-media/
+/uploads/
+/media/
 
 # Node / React Native
 node_modules/
