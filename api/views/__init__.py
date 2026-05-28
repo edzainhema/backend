@@ -169,7 +169,7 @@ from ..services.feed_helpers import (
     get_followed_feed,
     get_suggested_feed,
 )
-from ..services.media_processing import (
+from ..services.media import (
     _sniff_video_signature,
     verify_uploaded_media,
     _first_existing,

@@ -99,7 +99,7 @@ def _rail_activity(request, user, context, *, offset: int, limit: int,
         candidates = _annotate_for_serialize(candidates, user).order_by("-created_at")[:ACTIVITY_POOL]
         candidates = list(candidates)
 
-        from ...comment_analyzer import extract_post_keywords
+        from ...services.comment_analyzer import extract_post_keywords
 
         # Prefetch the candidate posts' hashtags from the index in ONE
         # query, instead of re-running the extraction regex on every

@@ -6,7 +6,7 @@ from rest_framework import serializers
 from ..models import (
     Media,
 )
-from ..post_media import ordered_media
+from ..services.post_media import ordered_media
 from .users import BasicUserSerializer
 from .pages import BasicPageSerializer
 

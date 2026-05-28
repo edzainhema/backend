@@ -10,16 +10,15 @@ from PIL import Image
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.db import transaction
-from django.db.models import Q
-from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ...models import BlockedUser, Follow, Notification, Page, PagePoster, Post, PostMedia
-from ...services.media_processing import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image, process_media_video, verify_uploaded_media
-from ...utils import push_to_user, sync_post_hashtags
+from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image, process_media_video, verify_uploaded_media
+from ...services.push import push_to_user
+from ...services.hashtags import sync_post_hashtags
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +176,18 @@ def _validate_per_file_upload(request, files):
     """Validate each uploaded file (and any video thumbnail) up front:
     type, size cap, and magic-byte content check. Returns an error
     ``Response`` on the first bad file, or None if all files pass."""
-    # Cap thumbnails much tighter than full images. A thumbnail is a single
-    # still frame the client extracts client-side from the video; 5 MB is
-    # generous for any reasonable JPEG. Without this cap, the thumbnail
-    # slot acts as an arbitrary-file-upload primitive (the original code
-    # had no size/magic-byte check at all on thumbnails — finding #3 in
-    # UPLOAD_BUG_AUDIT.md).
-    THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+    # Cap thumbnails below full images, but with enough headroom for a
+    # FULL-RESOLUTION frame. The client now extracts the thumbnail at the
+    # clip's native resolution (so the thumbnail matches the video instead of
+    # the old 512px-downscaled frame), which means a 1080p/4K still can run to
+    # several MB — the previous 5 MB cap would have started rejecting those
+    # legitimate uploads. 15 MB comfortably covers a high-quality JPEG of any
+    # frame we'd produce while still being far tighter than IMAGE_MAX_BYTES.
+    # The thumbnail remains fully validated below (magic-byte sniff +
+    # decompression-bomb guard), so raising the byte cap doesn't reopen the
+    # arbitrary-file-upload hole from finding #3 in UPLOAD_BUG_AUDIT.md — it
+    # only allows a larger *image*.
+    THUMBNAIL_MAX_BYTES = 15 * 1024 * 1024  # 15 MB
     # ── Validate file size, type, and content up front ────────────────
     # The client's Content-Type header is freely spoofable, so we use it
     # only to pick a verifier (image vs video) and then confirm the bytes
@@ -477,17 +481,4 @@ def create_post(request):
         Follow.objects.filter(following=request.user).values_list("follower_id", flat=True)
     )
     if follower_ids:
-        cache.delete_many([f"suggested_feed_scores:{fid}" for fid in follower_ids])
-
-    return Response(
-        {
-            'message': 'Post created successfully',
-            'post': {
-                'id': post.id,
-                'description': post.description,
-                'location': post.location,
-                'media': created_media,
-            },
-        },
-        status=status.HTTP_201_CREATED,
-    )
+        cache.delete_man

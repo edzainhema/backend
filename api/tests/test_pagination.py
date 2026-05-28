@@ -6,11 +6,11 @@ input so a stale/garbage client token can never 500 an endpoint.
 """
 from django.test import SimpleTestCase
 
-from api.utils import encode_cursor, decode_cursor
+from api.services.pagination import encode_cursor, decode_cursor
 from api.feed import cursors as feed_cursors
 
 
-class UtilsCursorTests(SimpleTestCase):
+class PaginationCursorTests(SimpleTestCase):
     def test_round_trip_preserves_payload(self):
         payload = {"created_at": "2024-05-01T12:00:00Z", "id": 42}
         token = encode_cursor(payload)

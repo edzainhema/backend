@@ -26,7 +26,7 @@ def backfill(apps, schema_editor):
 
     # Import the extractor lazily. It's pure-Python with no app-registry
     # dependency, so it's safe to call from inside a migration.
-    from api.comment_analyzer import extract_hashtags
+    from api.services.comment_analyzer import extract_hashtags
 
     # Only posts that actually contain a "#" can have hashtags — this
     # prefilter skips the overwhelming majority of rows cheaply.

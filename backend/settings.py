@@ -42,22 +42,64 @@ FILE_UPLOAD_HANDLERS = [
     'django.core.files.uploadhandler.TemporaryFileUploadHandler',
 ]
 
-# Quick-start development settings - unsuitable for production
+# ---------------------------------------------------------------------------
+# Core security settings — environment-driven with safe local-dev fallbacks.
+# ---------------------------------------------------------------------------
+# Mirrors the env-var pattern already used by the database, cache, channel
+# layer, and Celery sections below: every setting falls back to a dev value
+# that lets `manage.py runserver` boot with no env vars set, AND every
+# unsafe-in-prod fallback is guarded by an `if not DEBUG` check at the bottom
+# of this block so production cannot accidentally ship with it.
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-v535mhy%vke5gw_3m)-c#di(lywb=4%ngr_y4_y$qu3d+l3eq_'
+# In production set DJANGO_SECRET_KEY to a long random string (50+ chars).
+SECRET_KEY = os.environ.get(
+    "DJANGO_SECRET_KEY",
+    "django-insecure-v535mhy%vke5gw_3m)-c#di(lywb=4%ngr_y4_y$qu3d+l3eq_",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# In production set DJANGO_DEBUG=False (any of "false"/"0"/"no" works).
+DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() in ("true", "1", "yes")
 
-ALLOWED_HOSTS = ['*']
+# Comma-separated list. In production set DJANGO_ALLOWED_HOSTS to your
+# hostnames, e.g. "here-social.com,api.here-social.com".
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+    if h.strip()
+]
 
 # ✅ Used by consumers.py to build absolute avatar URLs over WebSocket
 # (WebSocket consumers have no request object, so they can't call
-#  request.build_absolute_uri). Update this to your server's public URL
-# before deploying to production. No trailing slash.
-SITE_URL = 'http://localhost:8000'
+#  request.build_absolute_uri). In production set SITE_URL to your public
+# origin (e.g. https://here-social.com). No trailing slash.
+SITE_URL = os.environ.get("SITE_URL", "http://localhost:8000")
+
+# Production guards (R2). Mirror the INF-1 / INF-2 / INF-3 pattern below:
+# fail fast and loudly at boot if any of the dev fallbacks above are still
+# in effect when DEBUG is off, instead of silently shipping insecure values.
+# Local dev (DEBUG=True, no env vars set) is unaffected; only DEBUG=False
+# combined with an unsafe fallback trips these.
+if not DEBUG:
+    from django.core.exceptions import ImproperlyConfigured
+
+    if SECRET_KEY.startswith("django-insecure-"):
+        raise ImproperlyConfigured(
+            "Refusing to start with the scaffolding SECRET_KEY in production. "
+            "Set DJANGO_SECRET_KEY to a long random string."
+        )
+    if ALLOWED_HOSTS == ["*"]:
+        raise ImproperlyConfigured(
+            "Refusing to start with ALLOWED_HOSTS=['*'] in production. "
+            "Set DJANGO_ALLOWED_HOSTS to a comma-separated list of your hostnames."
+        )
+    if SITE_URL.startswith(("http://localhost", "http://127.0.0.1")):
+        raise ImproperlyConfigured(
+            "Refusing to start with SITE_URL pointed at localhost in production. "
+            "Set SITE_URL to your public origin (e.g. https://here-social.com)."
+        )
 
 
 # Application definition

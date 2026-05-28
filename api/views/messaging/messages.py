@@ -2,13 +2,11 @@
 
 import mimetypes
 
-from datetime import timedelta
-
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.utils import timezone
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -17,11 +15,8 @@ from rest_framework.response import Response
 
 from ...models import BlockedUser, Conversation, ConversationHidden, Message, MessageMedia
 from ...serializers import MessageSerializer
-from ...utils import push_to_user
-
-MESSAGE_EDIT_MAX_LEN = 4000
-
-MESSAGE_EDIT_WINDOW = timedelta(minutes=15)
+from ...services.chat import MESSAGE_EDIT_MAX_LEN, MESSAGE_EDIT_WINDOW
+from ...services.push import push_to_user
 
 
 

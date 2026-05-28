@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from ..models import (
     Follow, Post, PostLike, PostMedia, PostMediaTag, SavedPost,
 )
-from ..post_media import ordered_media
+from ..services.post_media import ordered_media
 from ..services.feed_helpers import (
     build_feed_context, post_visibility_q, serialize_post,
     likes_count_subquery, comments_count_subquery, saves_count_subquery,

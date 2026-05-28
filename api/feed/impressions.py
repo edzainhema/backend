@@ -140,7 +140,7 @@ def record_impressions(user, serialized) -> None:
     ]
     if not items:
         return
-    from ..session_context import get_current_session_id
+    from ..services.session_context import get_current_session_id
     session_id = get_current_session_id()
     if not _enqueue_impressions(user.id, items, session_id):
         _write_impressions_sync(user.id, items, session_id)

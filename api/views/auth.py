@@ -1,76 +1,21 @@
-import json
-import math
-import mimetypes
-import re
 
-from collections import OrderedDict, defaultdict
-from datetime import timedelta
-from io import BytesIO
-from urllib.parse import urlencode
 
-from django.conf import settings
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
-from django.core.cache import cache
-from django.core.files.base import ContentFile
-from django.db import IntegrityError, models, transaction
-from django.db.models import (
-    Case, Count, Exists, F, IntegerField, OuterRef, Prefetch, Q, Value, When,
-)
-from django.http import JsonResponse
-from django.shortcuts import get_object_or_404, render
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
 
-from rest_framework import status
-from rest_framework.decorators import api_view, parser_classes, permission_classes
-from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from rest_framework_simplejwt.tokens import RefreshToken
 
-from asgiref.sync import async_to_sync
-from channels.layers import get_channel_layer
 
-from PIL import (
-    Image, ImageDraw, ImageEnhance, ImageFont, UnidentifiedImageError,
-)
 
 from ..models import (
-    Activity, BlockedUser, Comment, CommentLike, CommentMention, Conversation,
-    ConversationHidden, Device, Follow, FollowRequest, Media,
-    Memory, Message, MessageMedia, MessageReaction, MutedPage, MutedUser,
-    Notification, Page, PageChatMessage, PageFollow, PageFollowRequest,
-    PageInvite, PagePoster, PageReport, Post, PostLike, PostMedia,
-    PostMediaTag, PostReport, ProfileVisit, ReelWatch, SavedPost, SearchHistory,
-    UserProfile, UserReport, VideoWatch,
+    UserProfile,
 )
-from ..serializers import (
-    BasicPageSerializer, BasicUserSerializer, CommentSerializer,
-    ConversationSerializer, FeedPostSerializer, MediaSerializer,
-    MessageSerializer, NotificationSerializer, PageDetailSerializer,
-    PostMediaSerializer, ProfilePostSerializer, PublicUserProfileSerializer,
-    UserProfileSerializer,
-)
-from ..utils import log_activity, push_to_user, send_push_notification
-from ..comment_analyzer import analyze_comment, extract_hashtags
 from ..services.auth_helpers import (
     _find_user_by_identifier, _issue_tokens, _login_or_create_social_user,
-    _looks_like_email, _looks_like_phone, _normalize_phone, _username_from_seed,
-    _verify_facebook_access_token, _verify_google_id_token,
+    _looks_like_email, _looks_like_phone, _normalize_phone, _verify_facebook_access_token,
+    _verify_google_id_token,
 )
-from ..services.feed_helpers import (
-    build_feed_context, can_user_post_on_page, get_followed_feed,
-    get_friend_ids, get_muted_page_ids, get_social_overlap_score,
-    get_social_sets, get_suggested_feed, get_very_close_friend_ids,
-    merge_feed, recency_decay, serialize_post,
-)
-from ..services.media_processing import (
-    IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image,
-    process_media_video, resolve_overlay_font_path, verify_uploaded_media,
-    _safe_float, _safe_int, _safe_optional_float,
-)
-from ..video_filters import VIDEO_FILTER_CHAINS
 
 
 @api_view(['POST'])

@@ -86,7 +86,7 @@ def dispatch_push(recipient_id, title, body, extra_data=None):
     """
     from django.contrib.auth.models import User
 
-    from .utils import _send_push_to_user
+    from .services.push import _send_push_to_user
 
     try:
         recipient = User.objects.get(id=recipient_id)
@@ -116,7 +116,7 @@ def dispatch_push_to_many(recipient_ids, title, body, extra_data=None):
     from django.contrib.auth.models import User
 
     from .models import Device
-    from .utils import send_push_notification
+    from .services.push import send_push_notification
 
     ids = [r for r in (recipient_ids or []) if r]
     if not ids:

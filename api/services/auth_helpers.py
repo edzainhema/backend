@@ -10,7 +10,6 @@ import re
 
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
-from django.db import IntegrityError, transaction
 
 from rest_framework_simplejwt.tokens import RefreshToken
 

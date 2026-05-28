@@ -19,7 +19,7 @@ class ApiConfig(AppConfig):
         from django.core.cache import cache
         from django.db.models.signals import post_save, post_delete
         from .models import Notification
-        from .notification_cache import _unread_count_cache_key
+        from .services.notification_cache import _unread_count_cache_key
 
         def _invalidate_on_notification_change(sender, instance, **kwargs):
             # Any new notification could change the badge count for the

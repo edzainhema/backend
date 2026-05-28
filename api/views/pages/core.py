@@ -15,8 +15,8 @@ from ...services.feed_helpers import (
     get_muted_page_ids,
     likes_count_subquery, comments_count_subquery, saves_count_subquery,
 )
-from ...services.media_processing import validate_image_upload
-from ...utils import push_to_user
+from ...services.media import validate_image_upload
+from ...services.push import push_to_user
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -302,7 +302,7 @@ def toggle_page_follow(request):
         cache.delete(f"suggested_feed_scores:{user.id}")
         return Response({"status": "unfollowed"})
 
-    # 🚫 BLOCK CHECK — mirrors toggle_follow (views/follow.py): if the page
+    # 🚫 BLOCK CHECK — mirrors toggle_follow (views/follow/toggle.py): if the page
     # owner has blocked you, or you have blocked the page owner, you cannot
     # start (or request) following. The unfollow path above is allowed
     # regardless, since unfollowing only cleans up an existing relationship.
@@ -388,7 +388,7 @@ def toggle_page_follow(request):
 def list_pages(request):
     # Paginate: the original endpoint returned every Page row in a single
     # response, which would scale to a full-table dump as the platform grows.
-    # Offset/limit matches the rest of the codebase (e.g. views/profile.py:108).
+    # Offset/limit matches the rest of the codebase (e.g. views/profile/directory.py).
     try:
         limit = int(request.query_params.get('limit', 30))
     except (TypeError, ValueError):

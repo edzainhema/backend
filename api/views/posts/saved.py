@@ -1,7 +1,7 @@
 """The viewer's saved-posts feed."""
 
 
-from django.db.models import Exists, OuterRef, Prefetch, Q
+from django.db.models import Exists, OuterRef, Prefetch
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -18,7 +18,7 @@ def saved_posts(request):
 
     # --------------------------------------------------
     # 📄 PAGINATION (offset/limit, capped — matches the rest of the codebase
-    # such as views/profile.py:108-117). The endpoint was previously
+    # such as views/profile/directory.py). The endpoint was previously
     # unpaginated, which meant a heavy saver could trigger hundreds of
     # follow-up queries and ship the entire collection in a single response.
     # --------------------------------------------------

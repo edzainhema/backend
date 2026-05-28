@@ -10,7 +10,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ...models import Notification, Page, PageFollow, PageFollowRequest
-from ...utils import decode_cursor, encode_cursor, push_to_user
+from ...services.push import push_to_user
+from ...services.pagination import decode_cursor, encode_cursor
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])

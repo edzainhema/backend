@@ -1,4 +1,4 @@
-from .session_context import (
+from .services.session_context import (
     clear_current_session_id, sanitize_session_id, set_current_session_id,
 )
 
@@ -51,6 +51,6 @@ class UpdateLastSeenMiddleware:
             # Throttled (WS-2): this hot-row write now happens at most once per
             # ~45s per user instead of on every request. touch_last_seen is
             # best-effort and never raises, so it can't break the response.
-            from .utils import touch_last_seen
+            from .services.presence import touch_last_seen
             touch_last_seen(request.user.id)
         return response

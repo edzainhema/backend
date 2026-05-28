@@ -30,7 +30,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ..models import Activity, ReelWatch
-from ..utils import build_activity, bump_activity_counter
+from ..services.activity import build_activity, bump_activity_counter
 
 logger = logging.getLogger(__name__)
 

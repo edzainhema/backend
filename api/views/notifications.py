@@ -207,7 +207,7 @@ def list_notifications(request):
 # can import them without dragging in views/__init__.py. The 30 s TTL is
 # invalidated on every Notification create (signal in apps.py) and on
 # every mark-read path, so the dot still updates promptly when it matters.
-from ..notification_cache import (
+from ..services.notification_cache import (
     UNREAD_COUNT_CACHE_TTL_S,
     _unread_count_cache_key,
     invalidate_unread_count_cache,

@@ -11,7 +11,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ...models import BlockedUser, Notification, Page, PageFollow, PageInvite
-from ...utils import decode_cursor, encode_cursor, push_to_user
+from ...services.push import push_to_user
+from ...services.pagination import decode_cursor, encode_cursor
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -340,7 +341,7 @@ def respond_to_page_invite(request):
     ).update(is_read=True)
 
     # `.update()` bypasses post_save, so invalidate the badge cache explicitly.
-    from ...notification_cache import invalidate_unread_count_cache
+    from ...services.notification_cache import invalidate_unread_count_cache
     invalidate_unread_count_cache(user.id)
 
     return Response({"status": action + "ed"})

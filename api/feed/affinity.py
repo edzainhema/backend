@@ -242,7 +242,7 @@ def _compute_affinity_profile(user) -> dict:
     # extract_post_keywords mines niche:/intent:/hashtag: tags from free text
     # — reused here to turn a search query into the SAME vocabulary the
     # candidate posts expose, so search intent (Signal 2) actually matches.
-    from ..comment_analyzer import extract_post_keywords
+    from ..services.comment_analyzer import extract_post_keywords
 
     author_aff: dict[int, float] = defaultdict(float)
     hashtag_aff: dict[str, float] = defaultdict(float)

@@ -1,8 +1,6 @@
 import mimetypes
 
-from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models import Q
 from django.shortcuts import get_object_or_404
 
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -13,7 +11,7 @@ from rest_framework.response import Response
 from ..models import (
     BlockedUser, Page, PageChatMessage, PageChatMessageMedia, PageFollow,
 )
-from ..utils import log_activity
+from ..services.activity import log_activity
 
 
 def _page_chat_member_or_403(user, page):

@@ -5,7 +5,7 @@ so its output contract is worth pinning down.
 """
 from django.test import SimpleTestCase
 
-from api.comment_analyzer import (
+from api.services.comment_analyzer import (
     analyze_comment,
     extract_hashtags,
     extract_post_keywords,

@@ -3,15 +3,15 @@ import logging
 
 
 from django.core.cache import cache
-from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from ...models import Activity, BlockedUser, NotInterested, Notification, Post, PostHashtag, PostLike, SavedPost
+from ...models import Activity, NotInterested, Notification, Post, PostHashtag, PostLike, SavedPost
 from ...services.feed_helpers import viewer_can_see_post
-from ...utils import log_activity, push_to_user
+from ...services.activity import log_activity
+from ...services.push import push_to_user
 
 logger = logging.getLogger(__name__)
 

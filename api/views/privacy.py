@@ -17,10 +17,7 @@ from rest_framework.response import Response
 from ..models import (
     BlockedUser, Follow, FollowRequest, MutedUser, PageFollow, PageFollowRequest,
 )
-from ..utils import (
-    decode_cursor,
-    encode_cursor,
-)
+from ..services.pagination import decode_cursor, encode_cursor
 from ..services.feed_helpers import (
     get_social_sets,
 )

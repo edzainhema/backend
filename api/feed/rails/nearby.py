@@ -107,7 +107,7 @@ def _rail_nearby(request, user, context, *, offset: int, limit: int,
         # Local import to avoid a circular: comment_analyzer imports nothing
         # from views or this module, but keeping it lazy makes test setup
         # cheaper.
-        from ...comment_analyzer import extract_hashtags
+        from ...services.comment_analyzer import extract_hashtags
 
         scored_pairs = []
         for p in candidates:
