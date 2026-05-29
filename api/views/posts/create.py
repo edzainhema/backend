@@ -16,6 +16,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ...models import BlockedUser, Follow, Notification, Page, PagePoster, Post, PostMedia
+from ...serializers import ProfilePostSerializer
 from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image, process_media_video, verify_uploaded_media
 from ...services.push import push_to_user
 from ...services.hashtags import sync_post_hashtags
@@ -481,4 +482,9 @@ def create_post(request):
         Follow.objects.filter(following=request.user).values_list("follower_id", flat=True)
     )
     if follower_ids:
-        cache.delete_man
+        cache.delete_many([f"suggested_feed_scores:{uid}" for uid in follower_ids])
+
+    return Response(
+        {'post': ProfilePostSerializer(post, context={'request': request}).data},
+        status=status.HTTP_201_CREATED,
+    )
