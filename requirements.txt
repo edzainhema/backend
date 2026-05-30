@@ -69,3 +69,13 @@ ffmpeg-python==0.2.0          # needs the `ffmpeg` system binary (see note above
 #     cross-process seen-set + drain_impressions, and all cross-worker shared
 #     cache state). Both activate when REDIS_URL (or REDIS_CACHE_URL) is set
 #     and fall back to in-process equivalents for local dev. See INF-1/INF-2.
+
+# S3 storage (added after deploy)
+django-storages[s3]==1.14.4
+boto3==1.35.0
+
+# AWS SES email backend
+django-ses==4.4.0
+
+# AWS SES email backend
+django-ses==4.7.2
