@@ -548,3 +548,18 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 # Time limits so a hung task (e.g. a stuck FFmpeg transcode) can't run forever.
 CELERY_TASK_SOFT_TIME_LIMIT = int(os.environ.get("CELERY_TASK_SOFT_TIME_LIMIT", "300"))
 CELERY_TASK_TIME_LIMIT = int(os.environ.get("CELERY_TASK_TIME_LIMIT", "360"))
+
+# ---------------------------------------------------------------------------
+# AWS SES email backend (transactional: password reset, verification,
+# notifications). Uses the same boto3 credentials as S3. Sender is the
+# verified `here-social.com` domain.
+# ---------------------------------------------------------------------------
+EMAIL_BACKEND = "django_ses.SESBackend"
+AWS_SES_REGION_NAME = os.environ.get("AWS_SES_REGION_NAME", "us-east-1")
+AWS_SES_REGION_ENDPOINT = f"email.{AWS_SES_REGION_NAME}.amazonaws.com"
+DEFAULT_FROM_EMAIL = os.environ.get(
+    "DEFAULT_FROM_EMAIL", "Here Social <noreply@here-social.com>"
+)
+SERVER_EMAIL = os.environ.get(
+    "SERVER_EMAIL", "noreply@here-social.com"
+)
