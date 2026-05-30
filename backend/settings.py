@@ -143,6 +143,46 @@ if not DEBUG:
     SESSION_COOKIE_HTTPONLY = True
 
 
+# ---------------------------------------------------------------------------
+# Sentry — production error reporting (sentry.io).
+# ---------------------------------------------------------------------------
+# Captures every unhandled exception in Django views, Channels consumers,
+# and background tasks, and forwards them to Sentry with the full stack
+# trace, request URL, user info (anonymized by default), and surrounding
+# code context. Without this, a 500 error for a real user is invisible
+# unless they tell you about it (most won't — they just close the app).
+#
+# Initialized only when SENTRY_DSN is set AND DEBUG is False so:
+#   - Local dev errors don't burn through the production Sentry quota
+#   - Forgetting to set SENTRY_DSN in production is silent (no crash on
+#     boot), since crash reporting is a nice-to-have, not a hard dep
+#
+# We disabled tracing / profiling at the Sentry project level (only
+# Error monitoring is enabled), so we set the sample rates to 0.0
+# explicitly here too — saves the SDK the work of collecting data it
+# would only discard.
+# ---------------------------------------------------------------------------
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+if SENTRY_DSN and not DEBUG:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        # PII = personally identifiable info (user.username, IP address,
+        # request headers). Off by default — flip to True later if you
+        # want richer Sentry issue context and have a privacy policy
+        # that allows it.
+        send_default_pii=False,
+        # Filterable tag in the Sentry UI. Lets you separate prod errors
+        # from staging errors when you eventually have a staging tier.
+        environment="production",
+        # Performance monitoring sample rates (0.0–1.0). We didn't enable
+        # tracing/profiling in the Sentry project, so keep these at 0 to
+        # avoid wasted SDK work.
+        traces_sample_rate=0.0,
+        profiles_sample_rate=0.0,
+    )
+
+
 # Application definition
 
 INSTALLED_APPS = [

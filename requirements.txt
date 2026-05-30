@@ -80,3 +80,8 @@ django-ses==4.7.2
 # CORS support for browser-based clients (django-cors-headers adds the
 # Access-Control-Allow-* headers based on CORS_ALLOWED_ORIGINS in settings.py)
 django-cors-headers==4.4.0
+
+# Sentry — production error reporting. Initialized in settings.py when
+# SENTRY_DSN is set + DEBUG is False. Auto-instruments Django, Channels,
+# DB queries, and Celery (when present).
+sentry-sdk[django]==2.18.0
