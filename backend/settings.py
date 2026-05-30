@@ -101,6 +101,47 @@ if not DEBUG:
             "Set SITE_URL to your public origin (e.g. https://here-social.com)."
         )
 
+    # ------------------------------------------------------------------
+    # Production security headers (R2 follow-up).
+    # ------------------------------------------------------------------
+    # nginx terminates TLS and forwards to gunicorn over a local HTTP
+    # socket. Without this, request.is_secure() returns False and the
+    # SECURE_SSL_REDIRECT below would cause an infinite redirect loop.
+    # The matching `proxy_set_header X-Forwarded-Proto $scheme;` already
+    # exists in our nginx site config.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+    # Force HTTPS at the Django layer (nginx also does this at the edge,
+    # but defense in depth — if nginx config drifts, Django still refuses
+    # to serve plaintext).
+    SECURE_SSL_REDIRECT = True
+
+    # HSTS: tells browsers to ONLY use HTTPS for here-social.com for the
+    # next year. After a browser sees this header once, it refuses to
+    # make HTTP requests to the domain even if the user types `http://`
+    # explicitly. Includes subdomains and is preload-eligible (submit at
+    # https://hstspreload.org once you're confident HTTPS won't break).
+    #
+    # ⚠️ Once published, browsers cache HSTS for SECURE_HSTS_SECONDS. If
+    # HTTPS ever stops working you cannot downgrade to HTTP — only fix
+    # is to restore HTTPS. Our certbot auto-renewal + port-80 open in
+    # the security group keeps this safe.
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+    # Cookies (session + CSRF) only sent over HTTPS. Without these, a
+    # user visiting http://here-social.com/... would leak their session
+    # ID / CSRF token over plaintext (where a network attacker could
+    # intercept and impersonate them).
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+    # Block JavaScript access to the session cookie (mitigates XSS-based
+    # session theft). Django's default is already True for this, but
+    # spelling it out makes the policy explicit and obvious to readers.
+    SESSION_COOKIE_HTTPONLY = True
+
 
 # Application definition
 
