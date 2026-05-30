@@ -30,3 +30,4 @@ ios/build/
 .vscode/
 .idea/
 db.sqlite3.bak
+/static/
