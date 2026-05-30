@@ -155,6 +155,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'channels',
+    'corsheaders',
     'api',
 ]
 
@@ -282,6 +283,11 @@ REST_FRAMEWORK = {
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # CorsMiddleware must be placed AS HIGH AS POSSIBLE (per django-cors-headers
+    # docs) — definitely before CommonMiddleware and any middleware that can
+    # generate responses. It adds the Access-Control-Allow-* headers to
+    # cross-origin responses based on CORS_ALLOWED_ORIGINS below.
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -569,3 +575,61 @@ DEFAULT_FROM_EMAIL = os.environ.get(
 SERVER_EMAIL = os.environ.get(
     "SERVER_EMAIL", "noreply@here-social.com"
 )
+
+
+# ---------------------------------------------------------------------------
+# CORS (Cross-Origin Resource Sharing).
+#
+# Only browser clients enforce CORS — the React Native mobile app does NOT.
+# This config matters when a web frontend, marketing site, admin tool, or
+# Postman-from-a-browser-extension makes API requests from a different
+# origin than where the API itself lives. Without these headers the browser
+# refuses to send the request.
+#
+# CORS_ALLOWED_ORIGINS is the explicit allowlist of origins that may call
+# the API. Anything not in this list is rejected by the browser regardless
+# of what Django does (so the list is fail-closed by default). Adding a
+# new web origin later is a one-line settings change.
+#
+# CORS_ALLOW_CREDENTIALS lets requests include cookies / Authorization
+# headers across origins. We need this because our auth is JWT-based and
+# the frontend sets `Authorization: Bearer <token>` from a different
+# origin than the API in dev.
+# ---------------------------------------------------------------------------
+CORS_ALLOWED_ORIGINS = [
+    "https://here-social.com",
+    "https://www.here-social.com",
+]
+
+# Local-dev origins, allowed only when DEBUG is on so production stays
+# fail-closed. Covers Expo dev tools / Metro (8081) and Vite / CRA web
+# dev servers (3000, 5173). Add more here if your dev stack uses them.
+if DEBUG:
+    CORS_ALLOWED_ORIGINS += [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8081",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8081",
+    ]
+
+CORS_ALLOW_CREDENTIALS = True
+
+# CSRF: when a browser frontend posts to here-social.com from a different
+# origin (e.g., app.here-social.com or a localhost dev server), Django's
+# CSRF middleware also checks the Origin header against this list. Mirror
+# the CORS allowlist so they stay in sync.
+CSRF_TRUSTED_ORIGINS = [
+    "https://here-social.com",
+    "https://www.here-social.com",
+]
+if DEBUG:
+    CSRF_TRUSTED_ORIGINS += [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8081",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8081",
+    ]
