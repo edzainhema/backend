@@ -40,6 +40,7 @@ from .feed import (
     home_feed,
     explore_feed,
 )
+from .health import health_check
 from .follow import (
     toggle_follow,
     approve_follow_request,

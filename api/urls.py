@@ -4,6 +4,12 @@ from rest_framework_simplejwt.views import TokenRefreshView, TokenVerifyView
 
 urlpatterns = [
 
+	# ---------------- Health ----------------
+	# Lightweight liveness/readiness probe for uptime monitors and
+	# (eventually) load balancer health checks. Public, ~5 ms, no DB
+	# writes. See api/views/health.py.
+	path("health/", views.health_check),
+
 	# ---------------- Auth ----------------
 	path("auth/register/", views.register_user),
 	path("auth/login/", views.login_user),
