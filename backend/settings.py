@@ -700,8 +700,12 @@ if os.environ.get("AWS_STORAGE_BUCKET_NAME"):
             "BACKEND": "storages.backends.s3.S3Storage",
         },
         "staticfiles": {
-            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+            "BACKEND": "storages.backends.s3.S3StaticStorage",
+            "OPTIONS": {
+                "location": "static",
+            },
         },
     }
 
-
+    # Resolve {% static %} template tags to CloudFront URLs (e.g. Django admin CSS).
+    STATIC_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/static/"
