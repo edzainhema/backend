@@ -29,7 +29,10 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 
-@api_view(["GET"])
+# Accept both GET and HEAD. HEAD is what most uptime monitors (UptimeRobot,
+# AWS ELB health checks, etc.) send by default — same response as GET but
+# without the body. Per HTTP spec, any GET endpoint should also handle HEAD.
+@api_view(["GET", "HEAD"])
 @permission_classes([AllowAny])
 def health_check(request):
     """Return 200 + {"status": "ok"} if DB and cache are reachable, else 503."""
