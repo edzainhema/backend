@@ -673,3 +673,35 @@ if DEBUG:
         "http://127.0.0.1:5173",
         "http://127.0.0.1:8081",
     ]
+
+# ---------------------------------------------------------------------------
+# S3 storage for user-uploaded media (PostMedia.file, avatars, page covers).
+# Activated when AWS_STORAGE_BUCKET_NAME is set in .env — otherwise Django
+# falls back to FileSystemStorage so local dev and the test suite still work
+# without needing AWS credentials. Served via CloudFront in production
+# (AWS_S3_CUSTOM_DOMAIN), so URLs look like:
+#     https://d8xnzkd0uzugq.cloudfront.net/uploads/<filename>
+# ---------------------------------------------------------------------------
+if os.environ.get("AWS_STORAGE_BUCKET_NAME"):
+    AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
+    AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
+    AWS_STORAGE_BUCKET_NAME = os.environ["AWS_STORAGE_BUCKET_NAME"]
+    AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME", "us-east-1")
+    AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_S3_CUSTOM_DOMAIN")  # CloudFront, no scheme
+    AWS_S3_OBJECT_PARAMETERS = {
+        "CacheControl": "max-age=86400, public, immutable",
+    }
+    AWS_DEFAULT_ACL = None              # bucket policy controls public access, not per-object ACLs
+    AWS_QUERYSTRING_AUTH = False        # plain public URLs, no presigning
+    AWS_S3_FILE_OVERWRITE = False       # Django appends random suffix on filename collision
+
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3.S3Storage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+
+
