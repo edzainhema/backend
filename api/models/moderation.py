@@ -8,7 +8,49 @@ from django.db.models import Q
 from django.contrib.auth.models import User
 
 
-class PostReport(models.Model):
+class ReportTriage(models.Model):
+    """Shared moderation-workflow fields for every *Report model (audit H4).
+
+    Reports used to be append-only rows with no lifecycle: a moderator opening
+    the admin couldn't tell handled from unhandled, mark one resolved, or avoid
+    two people working the same row. These fields add a minimal triage workflow,
+    kept identical across PostReport / UserReport / PageReport BY CONSTRUCTION
+    (one abstract base) so the three queues can't drift apart.
+
+    The per-class ``handled_by`` related_name uses Django's ``%(class)s``
+    substitution, so each concrete model gets its own reverse accessor
+    (``postreport_handled`` / ``userreport_handled`` / ``pagereport_handled``)
+    with no clash.
+    """
+    STATUS_OPEN = "open"
+    STATUS_REVIEWING = "reviewing"
+    STATUS_ACTIONED = "actioned"
+    STATUS_DISMISSED = "dismissed"
+    STATUS_CHOICES = (
+        (STATUS_OPEN, "Open"),
+        (STATUS_REVIEWING, "Reviewing"),
+        (STATUS_ACTIONED, "Actioned — content/account acted on"),
+        (STATUS_DISMISSED, "Dismissed — no action needed"),
+    )
+
+    status = models.CharField(
+        max_length=12, choices=STATUS_CHOICES, default=STATUS_OPEN, db_index=True,
+    )
+    handled_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="%(class)s_handled",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in (self.STATUS_OPEN, self.STATUS_REVIEWING)
+
+
+class PostReport(ReportTriage):
     REPORT_REASONS = (
         ("spam", "Spam"),
         ("nudity", "Nudity or sexual content"),
@@ -96,7 +138,7 @@ class BlockedUser(models.Model):
             ),
         ]
 
-class UserReport(models.Model):
+class UserReport(ReportTriage):
     REPORT_REASONS = (
         ("spam", "Spam"),
         ("harassment", "Harassment or hate"),

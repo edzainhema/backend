@@ -383,6 +383,7 @@ def compose_home_feed_page(request, user, serialize_post_fn, build_feed_context_
         request, user, context,
         offset=a_offset, limit=max(slots["activity"], 1) * 2,
         exclude_ids=seen_ids,
+        profile=_profile,   # L10: reuse the profile loaded above for the layout
     )
     collaborative_items = _rail_collaborative(
         request, user, context,

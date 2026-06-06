@@ -18,6 +18,7 @@ from ...serializers import (
 )
 from ...services.feed_helpers import (
     likes_count_subquery, comments_count_subquery, saves_count_subquery,
+    post_visibility_q,
 )
 
 
@@ -296,9 +297,36 @@ def get_user_profile(request):
     ctx = {'request': request}
     has_more = False
     if can_view_posts:
+        # M4: the profile grid must respect PER-POST visibility, not just
+        # the target user's account-level privacy. Without this filter,
+        # a viewer who can see the profile (target is public OR viewer
+        # follows target) was shown every post by target_user --
+        # INCLUDING posts on private pages the viewer can't access. That
+        # leaks the private-page post's media + caption through the
+        # profile grid even when tapping the post would 404. Mirrors
+        # the gate `views/feed.py`, `views/reels.py`, and
+        # `views/search/posts.py` use. Skipping for own-profile views
+        # is a no-op (post_visibility_q's `own` branch matches every
+        # row when viewer == target), so we apply unconditionally.
+        followed_user_ids = set(
+            Follow.objects
+            .filter(follower=viewer)
+            .values_list("following_id", flat=True)
+        )
+        # Include pages the viewer OWNS as "followed" -- otherwise an
+        # owner viewing a contributor's profile wouldn't see their own
+        # page's posts. Mirrors search_posts' treatment.
+        followed_page_ids = set(
+            PageFollow.objects
+            .filter(user=viewer)
+            .values_list("page_id", flat=True)
+        ) | set(
+            Page.objects.filter(owner=viewer).values_list("id", flat=True)
+        )
         base_qs = (
             Post.objects
             .filter(user=target_user)
+            .filter(post_visibility_q(viewer, followed_user_ids, followed_page_ids))
             .select_related("page")          # ← only change
             # Named prefetch with pre-ordered media — see the same fix
             # in `profile()` above. Eliminates the N+1 inside

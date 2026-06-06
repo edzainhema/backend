@@ -11,11 +11,21 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from ...models import BlockedUser, Conversation, ConversationHidden, Follow, Message, MessageMedia
+from ...models import (
+    BlockedUser, Conversation, ConversationHidden,
+    ConversationParticipantState, Follow, Message, MessageMedia,
+)
 from ...serializers import ConversationSerializer
+from ...services.conversations import (
+    _count_request_creation,
+    accepted_state_exists_for,
+    check_request_throttle,
+    compute_initial_acceptance,
+    ensure_participant_states,
+    mark_accepted,
+)
 
 CONVERSATION_NAME_MAX_LEN = 100
-
 
 
 @api_view(['POST'])
@@ -29,14 +39,45 @@ def start_conversation(request):
     except User.DoesNotExist:
         return Response({"error": "User not found"}, status=404)
 
-    # 🔒 BLOCK CHECK (BOTH DIRECTIONS)
     if BlockedUser.objects.between(request.user, other_user).exists():
         return Response({"error": "Not allowed"}, status=403)
 
-    # 🔁 FIND-OR-CREATE 1-TO-1 CONVERSATION
-    # Lock both user rows in deterministic id order so two concurrent
-    # requests for the same pair serialize here instead of both creating
-    # a fresh Conversation row.
+    # M7: if `other_user` doesn't follow `request.user`, the conversation
+    # will be created in their REQUESTS inbox -- count it against the
+    # per-sender request throttle BEFORE we create anything. Following
+    # the existing convention this is keyed in the cache, not in DB,
+    # so the check is essentially free.
+    will_be_request = not Follow.objects.filter(
+        follower=other_user, following=request.user,
+    ).exists()
+    if will_be_request:
+        # Skip the throttle if a 1:1 conversation already exists with
+        # this user -- "starting" an existing thread isn't a NEW
+        # request. Uses the two-query candidate_ids pattern (same as
+        # the find-or-create dance below): chained M2M
+        # `.filter(participants=...).filter(participants=...)` plus
+        # `.annotate(Count("participants"))` produces inflated counts
+        # because Django joins the through-table for each filter AND
+        # the aggregate, double-counting rows.
+        candidate_ids = list(
+            Conversation.objects
+            .filter(participants=request.user)
+            .filter(participants=other_user)
+            .values_list("id", flat=True)
+        )
+        existing = (
+            Conversation.objects
+            .filter(id__in=candidate_ids)
+            .annotate(num=models.Count("participants"))
+            .filter(num=2)
+            .exists()
+        )
+        if not existing:
+            err = check_request_throttle(request.user.id)
+            if err:
+                return Response({"error": err}, status=429)
+
+    created = False
     with transaction.atomic():
         list(
             User.objects
@@ -45,20 +86,6 @@ def start_conversation(request):
             .order_by('id')
         )
 
-        # ⚠️  Why this is in TWO queries:
-        # Chaining `.filter(participants=A).filter(participants=B)` adds
-        # separate JOINs on the M2M table — each with its own WHERE
-        # constraint on user_id. If we then `.annotate(Count("participants"))`
-        # in the same queryset, Django can reuse one of those constrained
-        # JOINs for the aggregation, which makes the count reflect the
-        # *filtered* participant set (effectively 1 or 2) instead of the
-        # conversation's true participant count. That made `num_participants=2`
-        # silently fail to match real 1-to-1 conversations between
-        # request.user and other_user, so we always fell through to
-        # `Conversation.objects.create()` and produced a duplicate convo
-        # every time. Evaluating the candidate IDs into a Python list
-        # before the count annotation isolates the aggregation, so the
-        # count is computed against all participants of those candidates.
         candidate_ids = list(
             Conversation.objects
             .filter(participants=request.user)
@@ -76,30 +103,35 @@ def start_conversation(request):
         if not convo:
             convo = Conversation.objects.create()
             convo.participants.add(request.user, other_user)
+            ensure_participant_states(
+                convo.id, request.user.id,
+                [request.user.id, other_user.id],
+            )
+            created = True
 
-        # If the convo was previously soft-hidden by this user (via
-        # ConversationHidden), un-hide it so it shows up in their inbox
-        # again — otherwise clicking Message looks like nothing happened
-        # because the existing thread is still hidden.
         ConversationHidden.objects.filter(
             user=request.user, conversation=convo
         ).delete()
 
-    return Response({"conversation_id": convo.id})
+    # M7: count the request creation against the rolling cap ONLY if we
+    # actually created a new conversation AND it's a request from the
+    # recipient's perspective. Re-opening an existing thread doesn't
+    # consume the quota.
+    if created and will_be_request:
+        _count_request_creation(request.user.id)
 
+    return Response({"conversation_id": convo.id})
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def start_group_conversation(request):
     user_ids = request.data.get("user_ids", [])
-    # ✅ NEW: optional group name
     group_name = (request.data.get("name") or "").strip()
 
     if not isinstance(user_ids, list) or not user_ids:
         return Response({"error": "user_ids must be a non-empty list"}, status=400)
 
-    # Remove duplicates & self
     user_ids = list(set(uid for uid in user_ids if uid != request.user.id))
     if not user_ids:
         return Response({"error": "No valid users to add"}, status=400)
@@ -108,12 +140,10 @@ def start_group_conversation(request):
     if users.count() != len(user_ids):
         return Response({"error": "One or more users not found"}, status=404)
 
-    # 🚫 BLOCK CHECK (REQUESTER ↔ EACH USER)
     for other_user in users:
         if BlockedUser.objects.between(request.user, other_user).exists():
             return Response({"error": "Not allowed"}, status=403)
 
-    # 🔁 PREVENT DUPLICATE GROUP (same participants, same size)
     participant_ids = sorted([request.user.id] + user_ids)
 
     existing_convo = (
@@ -127,27 +157,40 @@ def start_group_conversation(request):
         if ids == participant_ids:
             return Response({"conversation_id": convo.id})
 
-    # ➕ CREATE GROUP CONVERSATION
+    # M7: pre-flight the request throttle if ANY recipient doesn't
+    # follow the creator. A group with even one non-follower is a
+    # request for that recipient and counts.
+    initial_acceptance = compute_initial_acceptance(
+        request.user.id, user_ids,
+    )
+    has_request_recipient = any(
+        not accepted for accepted in initial_acceptance.values()
+    )
+    if has_request_recipient:
+        err = check_request_throttle(request.user.id)
+        if err:
+            return Response({"error": err}, status=429)
+
     convo = Conversation.objects.create(name=group_name)
     convo.participants.add(request.user, *users)
+    ensure_participant_states(
+        convo.id, request.user.id,
+        [request.user.id] + list(user_ids),
+    )
+
+    if has_request_recipient:
+        _count_request_creation(request.user.id)
 
     return Response({"conversation_id": convo.id}, status=201)
 
 
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def list_conversations(request):
+def _list_conversations_impl(request, *, accepted: bool):
+    """Shared body for the main-inbox listing (``accepted=True``) and the
+    requests-inbox listing (``accepted=False``). The only difference
+    between the two is the participant-state filter. M7.
+    """
     user = request.user
 
-    # --------------------------------------------------
-    # PAGINATION
-    # The endpoint used to return every conversation the user had ever
-    # been part of in a single response. A power user with hundreds of
-    # threads would re-pull the entire inbox on every tap of Messages.
-    # Same offset/limit + limit+1 pattern used in reels_feed,
-    # list_notifications, and get_page_detail.
-    # --------------------------------------------------
     try:
         limit = int(request.query_params.get("limit", 20))
     except (TypeError, ValueError):
@@ -159,7 +202,6 @@ def list_conversations(request):
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
 
-    # 🚫 BLOCKED USERS (both directions)
     blocked_pairs = BlockedUser.objects.involving(user).values_list(
         "user_id", "blocked_user_id"
     )
@@ -170,30 +212,44 @@ def list_conversations(request):
         blocked_user_ids.add(b)
     blocked_user_ids.discard(user.id)
 
-    # 🙈 HIDDEN CONVERSATIONS (SOFT DELETE)
     hidden_convo_ids = list(ConversationHidden.objects.filter(
         user=user
     ).values_list("conversation_id", flat=True))
 
-    # Build the queryset with all filters applied at the DB layer so the
-    # slice we apply below corresponds to actual page boundaries. The old
-    # version filtered blocked-user threads in Python AFTER materialising
-    # every conversation -- that prevented pagination because the page
-    # size after the Python filter no longer matched what the DB returned.
-    #
-    # `.distinct()` is necessary because the M2M JOIN through participants
-    # can otherwise produce duplicate Conversation rows when there are
-    # multiple non-blocked participants. The `-id` tiebreaker keeps the
-    # ordering stable across paginated requests (two conversations that
-    # share an `updated_at` won't swap pages mid-pagination).
-    #
-    # NOTE: deliberately NOT prefetching every Message in every conversation
-    # -- for a user with long chats that would load the entire message
-    # corpus per inbox render. Instead we issue two bounded follow-up
-    # queries below: one for the latest message of each convo, one for
-    # the unread aggregate.
+    # M7: pick the right state bucket for THIS caller. Conversations
+    # where a state row is missing (legacy / pre-migration) are
+    # treated as accepted so they land in the main inbox -- same
+    # grandfather rule as `is_accepted_for` in the service.
+    if accepted:
+        state_convo_ids = list(
+            ConversationParticipantState.objects
+            .filter(user=user, is_accepted=True)
+            .values_list("conversation_id", flat=True)
+        )
+        # Also include any of the user's conversations with NO state
+        # row at all (defensive fallback for grandfathered data the
+        # migration somehow didn't reach).
+        with_state_ids = set(
+            ConversationParticipantState.objects
+            .filter(user=user)
+            .values_list("conversation_id", flat=True)
+        )
+        ungranted_ids = list(
+            user.conversations.exclude(id__in=with_state_ids)
+            .values_list("id", flat=True)
+        )
+        include_ids = set(state_convo_ids) | set(ungranted_ids)
+        base_qs = Conversation.objects.filter(id__in=include_ids)
+    else:
+        state_convo_ids = list(
+            ConversationParticipantState.objects
+            .filter(user=user, is_accepted=False)
+            .values_list("conversation_id", flat=True)
+        )
+        base_qs = Conversation.objects.filter(id__in=state_convo_ids)
+
     base_qs = (
-        user.conversations
+        base_qs
         .exclude(id__in=hidden_convo_ids)
         .exclude(participants__id__in=blocked_user_ids)
         .distinct()
@@ -204,15 +260,12 @@ def list_conversations(request):
         .order_by("-updated_at", "-id")
     )
 
-    # limit+1 trick -- fetch one extra row to detect has_more without a
-    # separate COUNT(*) on the user's inbox.
     fetched = list(base_qs[offset:offset + limit + 1])
     has_more = len(fetched) > limit
     filtered = fetched[:limit]
 
     convo_ids = [c.id for c in filtered]
 
-    # ── Latest message per conversation (one query, DB-agnostic) ────────
     last_msg_map = {}
     legacy_media_map = {}
     if convo_ids:
@@ -227,16 +280,27 @@ def list_conversations(request):
             for m in (
                 Message.objects
                 .filter(id__in=latest_ids)
-                .select_related("sender__userprofile")
+                .select_related(
+                    "sender__userprofile",
+                    # Pre-join the shared post + its author so the inbox preview
+                    # "<user> sent a post by <author>" can format from cache,
+                    # not a per-row follow-up query.
+                    "shared_post",
+                    "shared_post__user",
+                )
             ):
                 last_msg_map[m.conversation_id] = m
 
             # If the latest message stored its media only in MessageMedia
             # (no legacy `media_type` on Message), grab the first item's
-            # media_type so we can render the preview emoji.
+            # media_type so we can render the preview emoji. Skip shared-post
+            # messages -- their preview comes from shared_post, not media.
             blank_ids = [
                 m.id for m in last_msg_map.values()
-                if not m.is_deleted and not m.text and not m.media_type
+                if not m.is_deleted
+                and not m.text
+                and not m.media_type
+                and not m.shared_post_id
             ]
             if blank_ids:
                 for mm in (
@@ -246,7 +310,6 @@ def list_conversations(request):
                 ):
                     legacy_media_map.setdefault(mm.message_id, mm.media_type)
 
-    # ── Unread count per conversation (one aggregate query) ─────────────
     unread_map = {}
     if convo_ids:
         unread_rows = (
@@ -278,6 +341,88 @@ def list_conversations(request):
     })
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_conversations(request):
+    """Main inbox: conversations the caller has accepted (or which were
+    grandfathered as accepted by migration 0100)."""
+    return _list_conversations_impl(request, accepted=True)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_message_requests(request):
+    """Requests inbox: conversations from senders the caller doesn't
+    follow that haven't been accepted yet (M7). Identical response
+    shape to ``list_conversations`` so the frontend can render with
+    the same components -- only the filter differs."""
+    return _list_conversations_impl(request, accepted=False)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def accept_message_request(request):
+    """Explicit accept: flips the caller's state row to is_accepted=True
+    so the conversation moves from their requests inbox to their main
+    inbox. Idempotent -- accepting an already-accepted conversation
+    returns 200 with status=already_accepted.
+
+    The implicit-accept path (sending a reply) calls the same
+    `mark_accepted` helper, so a caller who replies without
+    explicitly accepting first ends up in the same state.
+    """
+    conversation_id = request.data.get("conversation_id")
+    if not conversation_id:
+        return Response({"error": "conversation_id required"}, status=400)
+
+    try:
+        convo = Conversation.objects.get(id=conversation_id)
+    except Conversation.DoesNotExist:
+        return Response({"error": "Conversation not found"}, status=404)
+
+    if request.user not in convo.participants.all():
+        return Response({"error": "Not allowed"}, status=403)
+
+    flipped = mark_accepted(convo.id, request.user.id)
+    return Response({
+        "status": "accepted" if flipped else "already_accepted",
+        "conversation_id": convo.id,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def decline_message_request(request):
+    """Decline: hide the conversation from the caller (via the existing
+    ConversationHidden mechanism, identical to delete_conversation).
+
+    The sender is silently uninformed -- the Instagram pattern. No
+    "rejected" notification, no read receipt. The conversation row
+    itself is preserved so the OTHER participant(s) keep their copy
+    of the thread; only the caller stops seeing it.
+
+    A future message from the same sender to the same caller will
+    re-create the state and put the conversation back in requests
+    -- decline is per-thread, not a permanent block. Use the block
+    endpoint for permanent silencing.
+    """
+    conversation_id = request.data.get("conversation_id")
+    if not conversation_id:
+        return Response({"error": "conversation_id required"}, status=400)
+
+    try:
+        convo = Conversation.objects.get(id=conversation_id)
+    except Conversation.DoesNotExist:
+        return Response({"error": "Conversation not found"}, status=404)
+
+    if request.user not in convo.participants.all():
+        return Response({"error": "Not allowed"}, status=403)
+
+    ConversationHidden.objects.get_or_create(
+        user=request.user, conversation=convo,
+    )
+    return Response({"status": "declined", "conversation_id": convo.id})
+
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -294,21 +439,10 @@ def delete_conversation(request):
     return Response({"status": "hidden"})
 
 
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def rename_conversation(request):
-    """
-    Rename a *group* conversation (any participant can rename).
-    POST /auth/conversations/rename/  { conversation_id, name }
-    Broadcasts conversation.renamed to the WS group.
-
-    Constraints:
-      • Only group conversations (≥3 participants) can be renamed.
-      • Name capped at ``CONVERSATION_NAME_MAX_LEN`` characters to match
-        the underlying model field (the model would raise DataError on
-        oversized input).
-    """
+    """Rename a group conversation (>=3 participants)."""
     conversation_id = request.data.get("conversation_id")
     new_name        = (request.data.get("name") or "").strip()
 
@@ -356,7 +490,6 @@ def rename_conversation(request):
     return Response({"status": "renamed", "name": new_name})
 
 
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def search_message_users(request):
@@ -378,7 +511,6 @@ def search_message_users(request):
         offset = 0
     offset = max(0, offset)
 
-    # 🚫 BLOCKED USERS (both directions)
     blocked_pairs = BlockedUser.objects.involving(user).values_list(
         "user_id", "blocked_user_id"
     )
@@ -389,7 +521,6 @@ def search_message_users(request):
         blocked_ids.add(b)
     blocked_ids.discard(user.id)
 
-    # 💬 USERS WITH EXISTING CONVERSATIONS
     convo_user_ids = set(
         Conversation.objects
         .filter(participants=user)
@@ -397,17 +528,10 @@ def search_message_users(request):
     )
     convo_user_ids.discard(user.id)
 
-    # 👥 USERS I FOLLOW
     following_ids = set(
         Follow.objects.filter(follower=user).values_list("following_id", flat=True)
     )
 
-    # 🔍 SEARCH USERS
-    #
-    # Rank in the DB instead of pulling every username match into memory to
-    # sort + slice in Python: existing conversation (0) ranks above followed
-    # (1) above everyone else (2), then alphabetical, with id as the final
-    # tiebreaker so the offset window stays stable across pages.
     users = (
         User.objects
         .filter(username__icontains=q)
@@ -425,7 +549,6 @@ def search_message_users(request):
         .order_by("convo_rank", "username", "id")
     )
 
-    # Offset window: fetch one extra row to detect `has_more` without a COUNT.
     window = list(users[offset : offset + limit + 1])
     has_more = len(window) > limit
     window = window[:limit]

@@ -6,9 +6,10 @@ import math
 from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
-from ..models import Follow, PageFollow, PostHashtag, PostLike, SavedPost
+from ..models import Follow, PageFollow, Post, PostHashtag, PostLike, SavedPost
 from .constants import CTR_RATE_SCALE, CTR_SMOOTHING, CTR_WEIGHT
 from ..services.feed_helpers import (
+    post_visibility_q,
     likes_count_subquery, comments_count_subquery, saves_count_subquery,
 )
 
@@ -125,6 +126,60 @@ def _exclude_not_interested(qs, context):
             id__in=PostHashtag.objects.filter(hashtag__in=ni_tags).values("post_id")
         )
     return qs
+
+
+
+def rehydrate_visible_slice(scored, *, user, context, exclude_ids, offset, limit):
+    """
+    Re-materialise a cached ``[(post_id, score), ...]`` rail list into the
+    ``[(post_id, score, post_obj), ...]`` slice for the requested page,
+    RE-APPLYING the per-viewer visibility / block / mute / not-interested gate
+    at fetch time. This is the shared cache-HIT path for the four per-viewer
+    discovery rails (activity, friend_network, nearby, collaborative).
+
+    Why re-checking here is mandatory (audit H1): each rail filters its
+    candidates when it BUILDS the cached score list, but that list lives for
+    the rail TTL (5–10 min) and visibility is NOT static over that window.
+    Between build and fetch a post can be made private (``toggle_post_public``),
+    its page can go super-private, its author can block the viewer, or the
+    viewer can block/mute the author/page or tap "not interested". Without this
+    re-check the post keeps surfacing in discovery for up to the TTL — in the
+    private-account case a real visibility leak, not just staleness.
+
+    ``_rail_trending`` already does exactly this for its global cache; factoring
+    it here keeps the per-viewer rails from drifting from that rule, per
+    docs/FEED_RANKING_SPEC.md: "No rail may build its own exclusions — drift
+    between rails is how a blocked user's post ends up in front of you."
+
+    Order is taken from the cached score list (already ranked + diversity-capped
+    at build time). offset/limit are applied AFTER visibility filtering so
+    dropped posts don't leave short pages — matching each rail's cache-miss
+    return, which also slices post-filter.
+    """
+    candidate_ids = [pid for pid, _ in scored if pid not in exclude_ids]
+    if not candidate_ids:
+        return []
+
+    visible_qs = (
+        _annotate_for_serialize(Post.objects.filter(id__in=candidate_ids), user)
+        .filter(post_visibility_q(
+            user, context["followed_users"], context["followed_pages"],
+        ))
+        .exclude(user_id__in=context["blocked_user_ids"])
+        .exclude(user_id__in=context["muted_user_ids"])
+        .exclude(page_id__in=context["muted_page_ids"])
+        .distinct()
+    )
+    visible_qs = _exclude_not_interested(visible_qs, context)
+
+    post_map = {p.id: p for p in visible_qs}
+    score_map = dict(scored)
+    out = [
+        (pid, score_map.get(pid, 0.0), post_map[pid])
+        for pid in candidate_ids
+        if pid in post_map
+    ]
+    return out[offset:offset + limit]
 
 
 

@@ -8,16 +8,27 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
-from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes, throttle_classes
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from ...models import BlockedUser, Conversation, ConversationHidden, Message, MessageMedia
+from ...models import (
+    BlockedUser, Conversation, ConversationHidden,
+    ConversationParticipantState, Follow, Message, MessageMedia,
+)
 from ...serializers import MessageSerializer
-from ...services.chat import MESSAGE_EDIT_MAX_LEN, MESSAGE_EDIT_WINDOW
+from ...services.chat import MAX_FILES_PER_MESSAGE, MESSAGE_EDIT_MAX_LEN, MESSAGE_EDIT_WINDOW, MESSAGE_MAX_LEN
+from ...services.conversations import (
+    _count_request_creation,
+    check_request_throttle,
+    ensure_participant_states,
+    get_accepted_recipient_ids,
+    mark_accepted,
+)
+from ...services.media import validate_uploaded_media_file
 from ...services.push import push_to_user
-
+from ...services.throttles import SendMessageRateThrottle
 
 
 def _push_new_message(convo, sender, text_preview: str, media_type=None):
@@ -25,19 +36,25 @@ def _push_new_message(convo, sender, text_preview: str, media_type=None):
 
     Note: a previous version batched all recipients into one multicast for
     performance, but with multi-account routing each recipient needs their
-    own for_user_id in the FCM data payload — otherwise a phone with two
+    own for_user_id in the FCM data payload -- otherwise a phone with two
     accounts logged in can't tell which account the message belongs to. So
     we fan out per recipient. For typical small group chats the extra round
     trips are negligible; for very large group chats this could be moved to
     a background queue (Celery, etc.) without changing behaviour.
+
+    M7: recipients whose ConversationParticipantState.is_accepted=False
+    are skipped -- a message in a request thread is silent on their
+    device until they accept. The badge on the requests tab handles
+    notification UX; pushing would defeat the spam-suppression point
+    of the requests inbox entirely.
     """
     if not text_preview:
         if media_type == 'image':
-            text_preview = '📷 Photo'
+            text_preview = 'Photo'
         elif media_type == 'video':
-            text_preview = '🎥 Video'
+            text_preview = 'Video'
         elif media_type == 'audio':
-            text_preview = '🎤 Voice message'
+            text_preview = 'Voice message'
         else:
             text_preview = 'New message'
 
@@ -45,8 +62,21 @@ def _push_new_message(convo, sender, text_preview: str, media_type=None):
     if not recipients:
         return
 
+    # M7: filter the recipient list down to those whose state row is
+    # is_accepted=True. Missing rows (legacy / grandfathered) default
+    # to True so they keep getting pushes, matching pre-M7 behaviour.
+    accepted_ids = get_accepted_recipient_ids(convo.id, sender.id)
+    recipients = [r for r in recipients if r.id in accepted_ids]
+    if not recipients:
+        return
+
     for recipient in recipients:
         try:
+            # M11: pass actor=sender so push_to_user can skip the push
+            # for recipients who've muted the sender. Without this, a
+            # muted DM still buzzes the recipient's phone -- the mute
+            # only suppresses the FEED, never the notification, which
+            # contradicts the typical product semantics.
             push_to_user(
                 recipient,
                 title=sender.username,
@@ -56,28 +86,53 @@ def _push_new_message(convo, sender, text_preview: str, media_type=None):
                     "conversation_id": convo.id,
                     "sender_id": sender.id,
                 },
+                actor=sender,
             )
         except Exception:
-            # Push failures must never break message delivery — keep going
-            # so a problem with one recipient doesn't starve the others.
             pass
 
 
-
 def _collect_typed_media(request):
-    """Gather media files from the request (single ``media`` field, or indexed
-    ``media_0..N`` for multi-send), detect each one's type, and validate.
-    Returns ``(typed_files, error_response)``; ``error_response`` is None on
-    success and a 400 ``Response`` if any file is an unsupported type."""
+    """Gather DM attachments and run each through the shared upload-safety
+    pipeline (audit B5).
+
+    Previously this only inspected the client-supplied Content-Type header
+    to classify each file, then handed the raw bytes to FileField.save() --
+    no size cap, no magic-byte verification, no decompression-bomb guard.
+    A user could DM a 2 GB file with Content-Type: image/png and it would
+    land in media/message_media/ unchallenged. Routing every file through
+    `validate_uploaded_media_file` closes that gap and keeps DM uploads
+    on the same hardened path post / comment uploads already use.
+
+    DMs accept all three media kinds (image / video / audio for voice
+    notes). The validator returns the detected kind, which we persist as
+    Message.media_type / MessageMedia.media_type without re-detecting.
+    """
     single_media = request.FILES.get('media')
+    # H5: bound the collection loop at MAX_FILES_PER_MESSAGE + 1 so we
+    # iterate at most one slot beyond the cap, then explicitly reject
+    # if another slot exists past that. Without this, the loop ran
+    # until it found a missing index -- a client posting media_0..
+    # media_99 would inflate the upload buffer + disk for all 100
+    # files before any per-endpoint validation. Django's
+    # DATA_UPLOAD_MAX_NUMBER_FILES caps at 100 by default which
+    # bounds the worst case at the framework level, but our 10 here
+    # matches the per-endpoint product cap that posts/create.py uses.
     indexed_media = []
-    i = 0
-    while True:
+    for i in range(MAX_FILES_PER_MESSAGE):
         f = request.FILES.get(f'media_{i}')
         if f is None:
             break
         indexed_media.append(f)
-        i += 1
+    # Sniff for one slot past the cap. If it's there the client tried
+    # to overshoot -- reject explicitly instead of silently dropping
+    # everything after the cap (which would leave the user confused
+    # about why some attachments "didn't send").
+    if request.FILES.get(f'media_{MAX_FILES_PER_MESSAGE}') is not None:
+        return None, Response(
+            {"error": f"Too many attachments (max {MAX_FILES_PER_MESSAGE})."},
+            status=400,
+        )
 
     if indexed_media:
         media_files = indexed_media
@@ -86,31 +141,25 @@ def _collect_typed_media(request):
     else:
         media_files = []
 
-    def detect_type(f):
-        mime = f.content_type or mimetypes.guess_type(f.name)[0] or ''
-        if mime.startswith('image/'):
-            return 'image'
-        if mime.startswith('video/'):
-            return 'video'
-        if mime.startswith('audio/'):
-            return 'audio'
-        return None
-
     typed_files = []
     for f in media_files:
-        t = detect_type(f)
-        if t is None:
-            return None, Response({"error": f"Unsupported media type for file: {f.name}"}, status=400)
-        typed_files.append((f, t))
+        try:
+            kind = validate_uploaded_media_file(
+                f, allow_kinds=('image', 'video', 'audio'),
+            )
+        except ValueError as exc:
+            # Surface the validator's user-safe message verbatim; it
+            # distinguishes "unsupported type" from "too large" from
+            # "doesn't look like the format you claimed", which the
+            # client can map to different toasts.
+            return None, Response(
+                {"error": f"{f.name}: {exc}"}, status=400,
+            )
+        typed_files.append((f, kind))
     return typed_files, None
 
 
 def _resolve_conversation_for_send(request, conversation_id, target_user_id):
-    """Resolve the target conversation: an existing one the user belongs to,
-    or a freshly-created (or found) DM with ``target_user_id``. Enforces block
-    rules in both directions. MUST be called inside a ``transaction.atomic()``
-    block — it uses ``select_for_update``. Returns ``(convo, error_response)``."""
-    # 🔹 CASE 1: EXISTING CONVERSATION
     if conversation_id:
         try:
             convo = (
@@ -132,7 +181,6 @@ def _resolve_conversation_for_send(request, conversation_id, target_user_id):
                 return None, Response({"error": "Not allowed"}, status=403)
         return convo, None
 
-    # 🔹 CASE 2: FIRST MESSAGE → CREATE DM
     if not target_user_id:
         return None, Response({"error": "target_user_id required"}, status=400)
     try:
@@ -143,9 +191,14 @@ def _resolve_conversation_for_send(request, conversation_id, target_user_id):
     if BlockedUser.objects.between(request.user, other_user).exists():
         return None, Response({"error": "Not allowed"}, status=403)
 
-    # Lock both user rows in deterministic id order before the find-or-create
-    # dance so two concurrent first-messages between the same pair don't both
-    # create a fresh Conversation.
+    # M7: implicit-create path -- send_message called with target_user_id
+    # instead of conversation_id. Mirror start_conversation's request-
+    # throttle pre-check so a sender can't bypass the cap by going
+    # straight to /send-message/ with target_user_id.
+    will_be_request = not Follow.objects.filter(
+        follower=other_user, following=request.user,
+    ).exists()
+
     list(
         User.objects
         .select_for_update()
@@ -161,15 +214,22 @@ def _resolve_conversation_for_send(request, conversation_id, target_user_id):
         .first()
     )
     if not convo:
+        if will_be_request:
+            err = check_request_throttle(request.user.id)
+            if err:
+                return None, Response({"error": err}, status=429)
         convo = Conversation.objects.create()
         convo.participants.add(request.user, other_user)
+        ensure_participant_states(
+            convo.id, request.user.id,
+            [request.user.id, other_user.id],
+        )
+        if will_be_request:
+            _count_request_creation(request.user.id)
     return convo, None
 
 
 def _persist_message(convo, sender, text, typed_files, reply_to_obj):
-    """Create the Message row plus its MessageMedia children. A single file
-    uses the legacy ``Message.media`` field and is mirrored into MessageMedia
-    by reference; multiple files fan out into ordered MessageMedia rows."""
     if len(typed_files) == 1:
         legacy_file, legacy_type = typed_files[0]
         message = Message.objects.create(
@@ -180,10 +240,6 @@ def _persist_message(convo, sender, text, typed_files, reply_to_obj):
             media_type=legacy_type,
             reply_to=reply_to_obj,
         )
-        # Mirror the file into MessageMedia by REFERENCING the existing
-        # storage path. Passing `file=message.media` to .create() would
-        # call storage.save() a second time and (with FileSystemStorage)
-        # produce a renamed duplicate on disk.
         mm = MessageMedia(
             message=message,
             media_type=legacy_type,
@@ -209,9 +265,6 @@ def _persist_message(convo, sender, text, typed_files, reply_to_obj):
 
 
 def _build_message_fields(request, message):
-    """Build the response/broadcast fields shared by the WS payload and the
-    REST response: absolute media URLs, the sender avatar, and the compact
-    reply_to payload."""
     media_items = [
         {"url": request.build_absolute_uri(item.file.url), "media_type": item.media_type}
         for item in message.media_items.all()
@@ -257,10 +310,6 @@ def _build_message_fields(request, message):
 
 
 def _broadcast_new_message(convo, request, message, fields):
-    """Relay the new message to the conversation's WS group. Fires
-    unconditionally (text or media): clients fall back to this REST endpoint
-    whenever the socket is down, and recipients dedup by message id, so a
-    text-only REST send must still reach other participants in real time."""
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(
         f"chat_{convo.id}",
@@ -293,11 +342,23 @@ def _broadcast_new_message(convo, request, message, fields):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser, JSONParser])
+@throttle_classes([SendMessageRateThrottle])
 def send_message(request):
     conversation_id = request.data.get('conversation_id')
     target_user_id  = request.data.get('target_user_id')
     text            = (request.data.get('text') or '').strip()
     reply_to_id     = request.data.get('reply_to_id')
+
+    # M10: cap text length before any other work. Same cap as the WS
+    # path enforces in services/chat.py:create_chat_message. The 400
+    # mentions the limit so the client can render a useful toast.
+    # Run BEFORE _collect_typed_media so a too-long text doesn't burn
+    # the per-file validation cost (which involves Pillow probes).
+    if len(text) > MESSAGE_MAX_LEN:
+        return Response(
+            {"error": f"Message too long (max {MESSAGE_MAX_LEN} chars)."},
+            status=400,
+        )
 
     typed_files, media_error = _collect_typed_media(request)
     if media_error:
@@ -312,7 +373,6 @@ def send_message(request):
         if convo_error:
             return convo_error
 
-        # Restore soft-deleted conversation visibility
         ConversationHidden.objects.filter(
             conversation=convo,
             user__in=convo.participants.all()
@@ -326,14 +386,18 @@ def send_message(request):
                 pass
 
         message = _persist_message(convo, request.user, text, typed_files, reply_to_obj)
-
-        # ✅ Bump updated_at so conversation list re-sorts correctly
         Conversation.objects.filter(id=convo.id).update(updated_at=timezone.now())
+
+        # M7: implicit accept. If the sender's own participant state for
+        # this conversation is is_accepted=False, sending a message
+        # promotes the conversation into their main inbox. (Reading
+        # never accepts; only sending does.) For the originator this
+        # is a no-op (their state was True from creation).
+        mark_accepted(convo.id, request.user.id)
 
     fields = _build_message_fields(request, message)
     _broadcast_new_message(convo, request, message, fields)
 
-    # ✅ Push notifications to other participants
     first_media_type = typed_files[0][1] if typed_files else None
     _push_new_message(convo, request.user, text, first_media_type)
 
@@ -362,7 +426,6 @@ def send_message(request):
     )
 
 
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_messages(request):
@@ -370,8 +433,6 @@ def get_messages(request):
     if not conversation_id:
         return Response({"error": "conversation_id required"}, status=400)
 
-    # ✅ NEW: pagination params — defensively parsed so a bogus value
-    # returns 400 instead of bubbling up as a 500.
     raw_limit = request.query_params.get('limit', 30)
     try:
         limit = min(max(int(raw_limit), 1), 100)
@@ -395,29 +456,29 @@ def get_messages(request):
     except Conversation.DoesNotExist:
         return Response({"error": "Conversation not found"}, status=404)
 
-    # 🔐 MUST BE A PARTICIPANT
     if request.user not in convo.participants.all():
         return Response({"error": "Not allowed"}, status=403)
 
-    # 🚫 BLOCK CHECK (AGAINST ALL OTHER PARTICIPANTS)
     for other_user in convo.participants.exclude(id=request.user.id):
         if BlockedUser.objects.between(request.user, other_user).exists():
-            # 👻 Appear as if convo doesn't exist
             return Response({"error": "Conversation not found"}, status=404)
 
     qs = (
         Message.objects
         .filter(conversation=convo)
-        .select_related("sender", "sender__userprofile", "reply_to__sender")
-        .prefetch_related("read_by", "reactions", "media_items")
-        .order_by("-created_at")  # newest first for efficient cursor slicing
+        .select_related(
+            "sender", "sender__userprofile",
+            "reply_to__sender",
+            "shared_post", "shared_post__user", "shared_post__user__userprofile",
+        )
+        .prefetch_related("read_by", "reactions", "media_items", "shared_post__media")
+        .order_by("-created_at")
     )
 
     if before_id is not None:
         qs = qs.filter(id__lt=before_id)
 
     messages = list(qs[:limit])
-    # ✅ Return in chronological order for the client
     messages.reverse()
 
     has_more = qs.filter(id__lt=messages[0].id).exists() if messages else False
@@ -429,24 +490,13 @@ def get_messages(request):
     return Response({
         "results":   data,
         "has_more":  has_more,
-        # client passes this as `before` on next page request
         "oldest_id": messages[0].id if messages else None,
     })
-
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def edit_message(request):
-    """
-    Edit the text of your own non-deleted message.
-    POST /auth/messages/edit/  { message_id, text }
-    Broadcasts message.edited to the conversation WS group.
-
-    Constraints:
-      • Max ``MESSAGE_EDIT_MAX_LEN`` characters.
-      • Must be edited within ``MESSAGE_EDIT_WINDOW`` of the original send.
-    """
     message_id = request.data.get("message_id")
     new_text   = (request.data.get("text") or "").strip()
 
@@ -467,12 +517,6 @@ def edit_message(request):
     if message.sender_id != request.user.id:
         return Response({"error": "Not your message."}, status=403)
 
-    # Block check (mirrors send_message at line ~322): in a two-person DM,
-    # if you and the other participant have fallen on either side of a
-    # block since the message was sent, the edit is denied — the
-    # message.edited WS broadcast would otherwise update the text on the
-    # blocker's screen. Group convos are left alone (mirrors send_message's
-    # "only enforce block in 2-person DMs" semantics).
     other_participants = message.conversation.participants.exclude(id=request.user.id)
     if other_participants.count() == 1:
         other = other_participants.first()
@@ -516,21 +560,9 @@ def edit_message(request):
     })
 
 
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def delete_message(request):
-    """
-    Soft-delete your own message.
-    POST /auth/messages/delete/  { message_id }
-    Broadcasts message.deleted to the conversation WS group.
-
-    Mirrors the WebSocket `message.delete` handler in ChatConsumer so
-    deletion still works when the client's socket is closed or reconnecting
-    — without this REST path, tapping Delete during a network blip silently
-    did nothing (the menu would close as if it had worked, leaving the
-    message visible on every recipient's screen).
-    """
     message_id = request.data.get("message_id")
     if not message_id:
         return Response({"error": "message_id required."}, status=400)
@@ -543,29 +575,15 @@ def delete_message(request):
     if message.sender_id != request.user.id:
         return Response({"error": "Not your message."}, status=403)
 
-    # Block check (mirrors send_message at line ~322): in a two-person DM,
-    # if you and the other participant have fallen on either side of a
-    # block since the message was sent, soft-delete is denied — the
-    # message.deleted WS broadcast would otherwise replace your message
-    # with "Message deleted" on the blocker's screen, which is the kind of
-    # harassment vector the block is supposed to prevent. Group convos are
-    # left alone for parity with send_message.
     other_participants = message.conversation.participants.exclude(id=request.user.id)
     if other_participants.count() == 1:
         other = other_participants.first()
         if BlockedUser.objects.between(request.user, other).exists():
             return Response({"error": "Not allowed."}, status=403)
 
-    # Idempotent: a retry after a flaky network shouldn't 400 just because
-    # the first attempt already landed. Treat repeated deletes as a success
-    # so the client UI can converge without surfacing a spurious error.
     if message.is_deleted:
         return Response({"status": "deleted", "message_id": message.id})
 
-    # Soft-delete + hard-delete the media blobs (legacy `media` field and any
-    # MessageMedia rows). Shared with the WS consumer via Message.soft_delete()
-    # so a deleted photo/video isn't left downloadable and storage doesn't
-    # accumulate orphans (M4).
     message.soft_delete()
 
     channel_layer = get_channel_layer()

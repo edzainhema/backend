@@ -6,16 +6,12 @@ from .read import (
     my_avatar,
     get_user_profile,
 )
-from .directory import (
-    list_users,
-)
 from .settings import (
     update_profile_settings,
     update_profile_avatar,
 )
 
 __all__ = [
-    "list_users",
     "profile",
     "my_avatar",
     "get_user_profile",

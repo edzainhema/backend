@@ -44,6 +44,17 @@ def get_comments(request):
         offset = 0
     offset = max(0, offset)
 
+    # Optional "pin this comment to the top" hint. Set by the Notifications ->
+    # Reel -> Comments flow so the notifying comment is the first thing the
+    # viewer sees, even when it would otherwise live deep in the thread or on
+    # a later page. Only honoured on the initial load (offset == 0); pagination
+    # responses ignore it so the pinned row doesn't reappear on every page.
+    try:
+        raw_highlight = request.query_params.get("highlight_comment_id")
+        highlight_comment_id = int(raw_highlight) if raw_highlight else None
+    except (TypeError, ValueError):
+        highlight_comment_id = None
+
     post = get_object_or_404(
         Post.objects.select_related("user", "user__userprofile", "page"),
         id=post_id,
@@ -52,7 +63,7 @@ def get_comments(request):
     # Visibility check: previously this endpoint only filtered comments by
     # block status, but happily returned the comment list for a post the
     # viewer couldn't otherwise see (private account they don't follow,
-    # private page they don't follow, etc.). Return 404 — not 403 — so we
+    # private page they don't follow, etc.). Return 404 -- not 403 -- so we
     # don't leak the existence of the post to a viewer who shouldn't know
     # about it.
     if not viewer_can_see_post(request.user, post):
@@ -72,7 +83,7 @@ def get_comments(request):
     # Annotate likes_count + is_liked at the SQL layer so the database returns
     # an integer and a boolean per comment, rather than handing back every
     # CommentLike row for Python to len()/scan. This is what keeps the endpoint
-    # cheap when a single comment gets thousands of likes — the wire and memory
+    # cheap when a single comment gets thousands of likes -- the wire and memory
     # cost is now O(1) per comment instead of O(likes).
     #
     # The likes_count_ann uses a filtered Count so likes from users the viewer
@@ -91,7 +102,7 @@ def get_comments(request):
 
     # Build the reply queryset once, with the same block-filter, ordering, and
     # annotations the top-level comments use. Attaching it via Prefetch
-    # (to_attr="filtered_replies") keeps the cache intact — calling
+    # (to_attr="filtered_replies") keeps the cache intact -- calling
     # c.replies.exclude(...) on a related manager would otherwise bust the
     # prefetch and issue a fresh query per top-level comment.
     reply_qs = (
@@ -104,6 +115,26 @@ def get_comments(request):
         )
         .order_by("created_at")
     )
+
+    # If the caller asked us to pin a specific comment to the top (initial
+    # load only), resolve it to the top-level thread that should be hoisted.
+    # Skip silently when anything is off (wrong post, blocked author, missing
+    # row) -- the rest of the response is still valid in that case.
+    pinned_top_id = None
+    if highlight_comment_id is not None and offset == 0:
+        try:
+            target = (
+                Comment.objects
+                .select_related("parent")
+                .get(id=highlight_comment_id, post=post)
+            )
+        except Comment.DoesNotExist:
+            target = None
+
+        if target is not None and target.user_id not in blocked_user_ids:
+            pinned_top_id = (
+                target.parent_id if target.parent_id is not None else target.id
+            )
 
     base = (
         Comment.objects
@@ -123,20 +154,42 @@ def get_comments(request):
         .order_by("created_at")
     )
 
+    # If we have a pinned top-level row to hoist, exclude it from the offset
+    # window so it doesn't render twice. We re-fetch it on the side below and
+    # splice it in at position 0.
+    if pinned_top_id is not None:
+        windowed = base.exclude(id=pinned_top_id)
+    else:
+        windowed = base
+
     # Fetch one extra row to learn whether another page exists without
     # paying for a separate COUNT(*) (which would scan the whole table for
     # popular posts). If we got back limit+1 rows, more pages remain; drop
     # the extra before serializing.
-    page = list(base[offset:offset + limit + 1])
+    page = list(windowed[offset:offset + limit + 1])
     has_more = len(page) > limit
     page = page[:limit]
+
+    # Resolve the pinned top-level row separately so it appears at position 0
+    # even when it would normally live further down the thread (or on a later
+    # page entirely). Uses the same annotations + prefetch as `base` so the
+    # serializer treats it identically.
+    pinned_row = None
+    if pinned_top_id is not None:
+        pinned_row = base.filter(id=pinned_top_id).first()
+        if pinned_row is None:
+            # The pinned ancestor was filtered out -- likely because the
+            # top-level author is blocked. Fall back to the unpinned response.
+            pinned_top_id = None
 
     ctx = {'request': request, 'viewer': request.user}
     data = []
 
-    for c in page:
+    rows = [pinned_row] + page if pinned_row is not None else page
+
+    for c in rows:
         # filtered_replies is the cached, pre-filtered list populated by the
-        # Prefetch above — zero extra queries per top-level comment.
+        # Prefetch above -- zero extra queries per top-level comment.
         replies = c.filtered_replies
         comment_data = CommentSerializer(c, context=ctx).data
         comment_data['replies'] = CommentSerializer(
@@ -147,7 +200,13 @@ def get_comments(request):
     return Response({
         "comments": data,
         "has_more": has_more,
-        "next_offset": offset + len(data) if has_more else None,
+        # The pinned row consumes one slot in the response but is NOT part of
+        # the offset window -- pagination should continue from where the window
+        # left off, otherwise the next page would skip a real comment.
+        "next_offset": offset + len(page) if has_more else None,
+        # Echo the resolved highlight ids so the client can apply the visual
+        # accent to the right row (the actual notified comment, which may be
+        # a reply nested inside the pinned top-level thread).
+        "highlighted_comment_id": highlight_comment_id if pinned_top_id is not None else None,
+        "highlighted_parent_id": pinned_top_id,
     })
-
-

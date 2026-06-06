@@ -41,6 +41,7 @@ from .messaging import (
     MessageReaction,
     MessageMedia,
     ConversationHidden,
+    ConversationParticipantState,
 )
 from .devices import (
     Device,

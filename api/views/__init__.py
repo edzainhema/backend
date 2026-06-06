@@ -23,7 +23,12 @@ from .activity_batch import log_activity_batch
 from .auth import (
     register_user,
     login_user,
+    logout_user,
     social_auth,
+    password_reset_request,
+    password_reset_confirm,
+    email_verification_request,
+    email_verification_confirm,
 )
 from .comments import (
     get_comments,
@@ -60,12 +65,17 @@ from .messaging import (
     send_message,
     get_messages,
     list_conversations,
+    list_message_requests,
+    accept_message_request,
+    decline_message_request,
     delete_conversation,
     react_to_message,
     edit_message,
     delete_message,
     rename_conversation,
     search_message_users,
+    list_share_recipients,
+    share_post_to_users,
 )
 from .notifications import (
     list_notifications,
@@ -123,7 +133,6 @@ from .privacy import (
     search_muted_users,
 )
 from .profile import (
-    list_users,
     profile,
     my_avatar,
     get_user_profile,
@@ -141,6 +150,7 @@ from .search import (
     search_history,
     search_posts,
     search_pages,
+    nearby_events,
 )
 
 # Service helpers re-exported for backwards compatibility.

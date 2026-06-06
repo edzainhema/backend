@@ -258,35 +258,54 @@ def get_suggested_feed(request, user, context, limit=20, offset=0):
             .order_by("-created_at")[:MAX_CANDIDATES]
         )
 
-        # Batch-fetch the entire follow graph for all candidate authors in
-        # two queries instead of 2-per-post (previously O(N) queries).
+        # Batch-fetch the follow graph for all candidate authors in two queries
+        # instead of 2-per-post (previously O(N) queries).
         candidate_user_ids = list({p.user_id for p in candidates})
 
-        # author_id → set of their follower IDs
-        author_followers_map: dict[int, set] = defaultdict(set)
-        for follower_id, following_id in (
-            Follow.objects
-            .filter(following_id__in=candidate_user_ids)
-            .values_list("follower_id", "following_id")
-        ):
-            author_followers_map[following_id].add(follower_id)
+        # M4/F2: push the intersection into the DB so each load is bounded by
+        # the VIEWER's graph, not by the biggest account in the candidate pool.
+        # These maps are consumed ONLY via `viewer_followers & author_followers`
+        # and `viewer_following & author_following` below — this rail has no
+        # close-friends term — so filtering each load to the viewer's own
+        # follower/following ids yields identical mutual counts (same scores,
+        # same suggested feed) while never pulling a celebrity candidate's
+        # entire follower list into memory.
+        viewer_followers = context["viewer_followers"]
+        viewer_following = context["viewer_following"]
 
-        # author_id → set of IDs they follow
+        # author_id → the subset of their followers who are viewer-followers
+        author_followers_map: dict[int, set] = defaultdict(set)
+        if viewer_followers:
+            for follower_id, following_id in (
+                Follow.objects
+                .filter(
+                    following_id__in=candidate_user_ids,
+                    follower_id__in=viewer_followers,
+                )
+                .values_list("follower_id", "following_id")
+            ):
+                author_followers_map[following_id].add(follower_id)
+
+        # author_id → the subset of accounts they follow that the viewer follows
         author_following_map: dict[int, set] = defaultdict(set)
-        for follower_id, following_id in (
-            Follow.objects
-            .filter(follower_id__in=candidate_user_ids)
-            .values_list("follower_id", "following_id")
-        ):
-            author_following_map[follower_id].add(following_id)
+        if viewer_following:
+            for follower_id, following_id in (
+                Follow.objects
+                .filter(
+                    follower_id__in=candidate_user_ids,
+                    following_id__in=viewer_following,
+                )
+                .values_list("follower_id", "following_id")
+            ):
+                author_following_map[follower_id].add(following_id)
 
         scored = []
         for post in candidates:
             author_followers = author_followers_map[post.user_id]
             author_following = author_following_map[post.user_id]
 
-            mutual_followers = len(context["viewer_followers"] & author_followers)
-            mutual_following = len(context["viewer_following"] & author_following)
+            mutual_followers = len(viewer_followers & author_followers)
+            mutual_following = len(viewer_following & author_following)
 
             social_score = mutual_followers * 3 + mutual_following * 2
             engagement_score = (

@@ -3,11 +3,16 @@
 Validates the /feed/ contract: auth-gated, and returns the documented
 {"results": [...], "following_count": N} shape.
 """
+from django.core.cache import cache
 from rest_framework.test import APITestCase
 
 
 class HomeFeedTests(APITestCase):
     def setUp(self):
+        # Clear DRF throttle counters so the B4 register cap (5/min) isn't
+        # tripped by accumulated /auth/register/ calls from sibling tests.
+        # (Matches the convention used across test_auth_api / test_message_*.)
+        cache.clear()
         reg = self.client.post("/auth/register/", {
             "username": "erin",
             "password": "feed-pass-123",

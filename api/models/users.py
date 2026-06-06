@@ -57,6 +57,21 @@ class UserProfile(models.Model):
     location_accuracy_m = models.FloatField(null=True, blank=True)
     location_updated_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
+    class Meta:
+        # H3 backstop: the partial UNIQUE on non-empty phone_number was
+        # added at the DB level via `migrations.AddConstraint` in 0099.
+        # That call updated Django's migration state but the matching
+        # `Meta.constraints` entry was missing here, so every
+        # `makemigrations` invocation produced a spurious "remove this
+        # constraint" diff. Declaring it here aligns model and state.
+        constraints = [
+            models.UniqueConstraint(
+                fields=['phone_number'],
+                condition=~models.Q(phone_number=''),
+                name='userprofile_phone_uniq',
+            ),
+        ]
+
     def can_change_username(self):
         if not self.last_username_change:
             return True

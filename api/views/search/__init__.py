@@ -13,10 +13,14 @@ from .posts import (
 from .pages import (
     search_pages,
 )
+from .events import (
+    nearby_events,
+)
 
 __all__ = [
     "search",
     "search_history",
     "search_posts",
     "search_pages",
+    "nearby_events",
 ]

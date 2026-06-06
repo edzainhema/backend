@@ -333,7 +333,6 @@ def _compute_affinity_profile(user) -> dict:
     tab_view_count = 0
 
     for a in acts:
-        n_events += 1
         action = a["action_type"]
 
         # ── Signal 1: tab dwell ─────────────────────────────────────────
@@ -424,6 +423,21 @@ def _compute_affinity_profile(user) -> dict:
             if depth < _COMMENT_SCROLL_MIN_DEPTH:
                 continue
             cscroll_scale = depth
+
+        # L8: this row survived every gate above — it isn't an impression /
+        # post_dwell / tab_view, and it cleared its per-action quality bar (an
+        # 8s+ post_view, a reel watched past the floor, a 3s+ visit, a
+        # deep-enough comment scroll). Only NOW does it count toward n_events,
+        # the "taste maturity" tally that flips the feed from cold-start to the
+        # personalised slot layout and scales the activity rail's quality bar
+        # (see rails/activity.py + layout.py). Counting it HERE — at the same
+        # point it actually credits affinity — keeps maturity in step with what
+        # the profile has genuinely learned, instead of racing to the cold-start
+        # threshold on impressions the feed logged just by showing the user a
+        # busy feed. (Negative deliberate actions — unlike / not_interested /
+        # reel_skip — are in _ACTION_POINTS and reach here too: they're real
+        # taste signals, just negative ones, so they correctly count.)
+        n_events += 1
 
         age_days = (now - a["created_at"]).total_seconds() / 86400.0
         decay = math.exp(-age_days / _AFFINITY_DECAY_HALF_LIFE_DAYS)

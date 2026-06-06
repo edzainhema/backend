@@ -184,6 +184,7 @@ def reels_feed(request):
                     "id": post.page.id,
                     "name": post.page.name,
                     "is_private": post.page.is_private,
+                    "is_super_private": post.page.is_super_private,
                     "avatar": (
                         request.build_absolute_uri(post.page.avatar.url)
                         if post.page.avatar

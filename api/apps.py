@@ -42,3 +42,14 @@ class ApiConfig(AppConfig):
             sender=Notification,
             dispatch_uid="invalidate_unread_count_on_notification_delete",
         )
+
+        # Pin Pillow's decompression-bomb ceiling process-wide at startup. The
+        # authoritative value and full rationale live in the upload validator
+        # (services/media/validation.py), which also applies it at its own
+        # import; we re-apply it here so the cap is guaranteed in force before
+        # the first request even if no image-handling module has been imported
+        # yet (e.g. a management command or signal that opens an image). Cheap:
+        # the validator only pulls in stdlib + PIL, both already loaded.
+        from PIL import Image
+        from .services.media.validation import IMAGE_MAX_PIXELS
+        Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS

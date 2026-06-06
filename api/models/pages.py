@@ -6,6 +6,12 @@
 from django.db import models
 from django.contrib.auth.models import User
 
+# Shared moderation-triage fields (status / handled_by / resolved_at) so the
+# PageReport queue has the same workflow as PostReport/UserReport (audit H4).
+# moderation.py imports nothing from pages.py, so this import is one-directional
+# (no cycle).
+from .moderation import ReportTriage
+
 
 class Page(models.Model):
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='owned_pages')
@@ -234,7 +240,7 @@ class MutedPage(models.Model):
     class Meta:
         unique_together = ("user", "page")
 
-class PageReport(models.Model):
+class PageReport(ReportTriage):
     REPORT_REASONS = (
         ("spam", "Spam"),
         ("impersonation", "Impersonation"),

@@ -262,6 +262,7 @@ def explore_feed(request):
                         else None
                     ),
                     "is_private": post.page.is_private,
+                    "is_super_private": post.page.is_super_private,
                 }
                 if post.page
                 else None

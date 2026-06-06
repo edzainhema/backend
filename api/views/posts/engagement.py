@@ -4,7 +4,7 @@ import logging
 
 from django.core.cache import cache
 from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -12,6 +12,7 @@ from ...models import Activity, NotInterested, Notification, Post, PostHashtag, 
 from ...services.feed_helpers import viewer_can_see_post
 from ...services.activity import log_activity
 from ...services.push import push_to_user
+from ...services.throttles import PostEngagementRateThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ def _activity_surface(request, default=""):
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([PostEngagementRateThrottle])
 def toggle_post_like(request):
     post_id = request.data.get("post_id")
 
@@ -124,6 +126,7 @@ def toggle_post_like(request):
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([PostEngagementRateThrottle])
 def toggle_post_save(request):
     post_id = request.data.get("post_id")
 

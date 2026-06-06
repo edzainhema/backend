@@ -5,29 +5,27 @@ from rest_framework_simplejwt.views import TokenRefreshView, TokenVerifyView
 urlpatterns = [
 
 	# ---------------- Health ----------------
-	# Lightweight liveness/readiness probe for uptime monitors and
-	# (eventually) load balancer health checks. Public, ~5 ms, no DB
-	# writes. See api/views/health.py.
 	path("health/", views.health_check),
 
 	# ---------------- Auth ----------------
 	path("auth/register/", views.register_user),
 	path("auth/login/", views.login_user),
+	path("auth/logout/", views.logout_user),
+	path("auth/password-reset-request/", views.password_reset_request),
+	path("auth/password-reset-confirm/", views.password_reset_confirm),
+	path("auth/email-verification-request/", views.email_verification_request),
+	path("auth/email-verification-confirm/", views.email_verification_confirm),
 	path("auth/social/", views.social_auth),
 	path("auth/token/refresh/", TokenRefreshView.as_view()),
 	path("auth/verify/", TokenVerifyView.as_view()),
 
 	# ---------------- Profiles ----------------
-	path("auth/profile/", views.profile),               # my profile
-	path("auth/me/avatar/", views.my_avatar),           # lightweight: avatar URL only
-	path("auth/user-profile/", views.get_user_profile), # other user's profile
-	path("auth/users/", views.list_users),              # list users
+	path("auth/profile/", views.profile),
+	path("auth/me/avatar/", views.my_avatar),
+	path("auth/user-profile/", views.get_user_profile),
 	path("auth/memories/", views.get_user_memories),
 	path("auth/memories/toggle/", views.toggle_page_memory),
-	path(
-		"auth/profile/settings/",
-		views.update_profile_settings
-	),
+	path("auth/profile/settings/", views.update_profile_settings),
 	path("auth/profile/avatar/", views.update_profile_avatar),
 
 
@@ -102,6 +100,12 @@ urlpatterns = [
 	path("auth/messages/edit/", views.edit_message),
 	path("auth/messages/delete/", views.delete_message),
 	path("auth/conversations/rename/", views.rename_conversation),
+	path("auth/messages/share-recipients/", views.list_share_recipients),
+	path("auth/messages/share-post/", views.share_post_to_users),
+	# Message requests (M7)
+	path("auth/conversations/requests/", views.list_message_requests),
+	path("auth/conversations/accept/", views.accept_message_request),
+	path("auth/conversations/decline/", views.decline_message_request),
 
 	# ---------------- Feed ----------------
 	path("feed/", views.home_feed),
@@ -123,6 +127,7 @@ urlpatterns = [
 	path("search/posts/", views.search_posts),
 	path("pages/search/", views.search_pages),
 	path("search/history/", views.search_history),
+	path("events/nearby/", views.nearby_events),
 
 	# ---------------- Comments ----------------
 	path("comments/", views.get_comments),
@@ -139,14 +144,8 @@ urlpatterns = [
 	path("explore/", views.explore_feed),
 
 	# ---------------- Analytics ----------------
-	path(
-		"analytics/profile-visit/",
-		views.log_profile_visit
-	),
-	path(
-		"analytics/video-watch/",
-		views.log_video_watch
-	),
+	path("analytics/profile-visit/", views.log_profile_visit),
+	path("analytics/video-watch/", views.log_video_watch),
 
 	# ---------------- Activity tracking ----------------
 	path("activity/post-view/",      views.log_post_view),
@@ -157,7 +156,6 @@ urlpatterns = [
 	path("activity/search-click/",   views.log_search_click),
 	path("activity/hashtag/",        views.log_hashtag_engagement),
 	path("activity/tab-view/",       views.log_tab_view),
-	# Batched ingest — the client buffers high-volume analytics and flushes
-	# them here in bulk instead of one POST per event.
+	# Batched ingest -- client buffers high-volume analytics and flushes in bulk.
 	path("activity/batch/",          views.log_activity_batch),
 ]

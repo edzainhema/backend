@@ -1,16 +1,17 @@
 """Nearby rail: recent, engaging posts within a radius of the viewer's last known location. Includes the viewer-location lookup it depends on."""
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import timedelta
 
 from django.core.cache import cache
 from django.utils import timezone
 
-from ...models import Activity, Post
+from ...models import Activity, Post, PostHashtag
 from ...services.feed_helpers import post_visibility_q
 from ..constants import LOCATION_FRESHNESS_DAYS, NEARBY_HALF_LIFE_DAYS, NEARBY_MIN_ENGAGEMENT, NEARBY_POOL, NEARBY_RADIUS_KM, NEARBY_TTL_S, NEARBY_WINDOW_DAYS
 from ..geo import bbox_for_radius, coarse_geohash, haversine_km, nearby_longitude_q
-from ..scoring import _annotate_for_serialize, _engagement_log, _engagement_score, _exclude_not_interested, recency_decay_days
+from ..scoring import _annotate_for_serialize, _engagement_log, _engagement_score, _exclude_not_interested, recency_decay_days, rehydrate_visible_slice
 
 # =============================================================================
 # RAIL (c) — Nearby
@@ -104,10 +105,23 @@ def _rail_nearby(request, user, context, *, offset: int, limit: int,
             .values_list("hashtag", flat=True)
         )
 
-        # Local import to avoid a circular: comment_analyzer imports nothing
-        # from views or this module, but keeping it lazy makes test setup
-        # cheaper.
-        from ...services.comment_analyzer import extract_hashtags
+        # L9: read each candidate's hashtags from the PostHashtag index in ONE
+        # query instead of re-running extract_hashtags over every description on
+        # the request thread. sync_post_hashtags populates that index via the
+        # SAME extract_hashtags (lowercased, de-duped, ≤100 chars — see
+        # services/hashtags.py and the PostHashtag model docstring), so the
+        # matched tags are identical, and it's the same source the activity rail
+        # already scores from. Used only for the boolean "shares a tag with the
+        # viewer's recently-engaged hashtags" boost below.
+        candidate_ids = [p.id for p in candidates]
+        post_hashtags_map: dict[int, list[str]] = defaultdict(list)
+        if candidate_ids:
+            for pid, tag in (
+                PostHashtag.objects
+                .filter(post_id__in=candidate_ids)
+                .values_list("post_id", "hashtag")
+            ):
+                post_hashtags_map[pid].append(tag)
 
         scored_pairs = []
         for p in candidates:
@@ -132,7 +146,7 @@ def _rail_nearby(request, user, context, *, offset: int, limit: int,
 
             proximity = max(0.0, 1.0 - distance_km / NEARBY_RADIUS_KM)
 
-            post_hashtags = extract_hashtags(p.description or "")
+            post_hashtags = post_hashtags_map.get(p.id, ())
             activity_match = 1.0
             if any(h in recent_engaged_hashtags for h in post_hashtags):
                 activity_match += 0.5
@@ -162,20 +176,11 @@ def _rail_nearby(request, user, context, *, offset: int, limit: int,
                 break
         return out[offset:offset + limit]
 
-    # Cache hit.
-    wanted_ids = [
-        pid for pid, _ in scored
-        if pid not in exclude_ids
-    ][offset:offset + limit]
-    if not wanted_ids:
-        return []
-    posts = list(
-        _annotate_for_serialize(Post.objects.filter(id__in=wanted_ids), user)
+    # Cache hit — re-apply the per-viewer visibility/block/mute/not-interested
+    # gate at fetch time (audit H1). The cached score list was filtered at build
+    # time, but it lives for NEARBY_TTL_S and visibility isn't static over that
+    # window. Shared helper so the rails can't drift.
+    return rehydrate_visible_slice(
+        scored, user=user, context=context,
+        exclude_ids=exclude_ids, offset=offset, limit=limit,
     )
-    post_map = {p.id: p for p in posts}
-    score_map = dict(scored)
-    return [
-        (pid, score_map[pid], post_map[pid])
-        for pid in wanted_ids
-        if pid in post_map
-    ]

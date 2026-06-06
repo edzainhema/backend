@@ -137,6 +137,11 @@ class NotificationSerializer(serializers.Serializer):
 
     def get_post(self, obj):
         post = obj.media
+        # post_tag carries its post via the `media` FK (set at creation),
+        # same as 'like' and 'mention', so it already resolves through the
+        # `post = obj.media` line above — no extra branch needed for it
+        # here. The comment-derived fallback only matters for the
+        # comment-rooted notif types.
         if not post and obj.notification_type in ('comment', 'comment_like', 'mention', 'comment_reply') and obj.comment_id:
             try:
                 post = obj.comment.post

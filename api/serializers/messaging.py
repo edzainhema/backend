@@ -1,6 +1,6 @@
 # Auto-split from the former monolithic api/serializers.py by domain.
 # Re-exported from api/serializers/__init__.py so `from api.serializers import X`
-# still works. Verified with Django system check + makemigrations --check.
+# still works.
 
 from rest_framework import serializers
 from ..models import (
@@ -19,7 +19,7 @@ class MessageSerializer(serializers.ModelSerializer):
     reactions     = serializers.SerializerMethodField()
     reply_to      = serializers.SerializerMethodField()
     media_items   = serializers.SerializerMethodField()
-    # ✅ NEW: edit fields
+    shared_post   = serializers.SerializerMethodField()
     is_edited     = serializers.BooleanField()
     last_edited_at = serializers.DateTimeField(allow_null=True)
 
@@ -32,6 +32,7 @@ class MessageSerializer(serializers.ModelSerializer):
             'read_by', 'is_mine',
             'media_url', 'media_type',
             'media_items',
+            'shared_post',
             'reactions',
             'reply_to',
         ]
@@ -76,6 +77,64 @@ class MessageSerializer(serializers.ModelSerializer):
             result[reaction.emoji] = result.get(reaction.emoji, 0) + 1
         return result
 
+    def get_shared_post(self, obj):
+        """
+        Compact preview of a post the sender shared into this DM.
+        Returns None when the message isn't a shared post or the post has
+        since been deleted (FK is SET_NULL).
+        """
+        if obj.is_deleted or not obj.shared_post_id:
+            return None
+        post = obj.shared_post
+        if post is None:
+            return None
+        request = self.context.get('request')
+
+        thumb = None
+        first_media_type = None
+        for m in post.media.all().order_by('order'):
+            if m.thumbnail:
+                thumb = (
+                    request.build_absolute_uri(m.thumbnail.url)
+                    if request else m.thumbnail.url
+                )
+            elif m.file:
+                thumb = (
+                    request.build_absolute_uri(m.file.url)
+                    if request else m.file.url
+                )
+            name = (m.file.name or '').lower() if m.file else ''
+            if name.endswith(('.mp4', '.mov', '.webm', '.m4v')):
+                first_media_type = 'video'
+            else:
+                first_media_type = 'image'
+            break
+
+        author = post.user
+        author_avatar = None
+        ap = getattr(author, 'userprofile', None)
+        if ap and ap.avatar:
+            author_avatar = (
+                request.build_absolute_uri(ap.avatar.url)
+                if request else ap.avatar.url
+            )
+
+        desc = (post.description or '')
+        if len(desc) > 140:
+            desc = desc[:140].rstrip() + '...'
+
+        return {
+            'id': post.id,
+            'description': desc,
+            'thumbnail': thumb,
+            'media_type': first_media_type,
+            'author': {
+                'id': author.id,
+                'username': author.username,
+                'avatar': author_avatar,
+            },
+        }
+
     def get_reply_to(self, obj):
         r = obj.reply_to
         if not r:
@@ -98,6 +157,7 @@ class MessageSerializer(serializers.ModelSerializer):
             "is_deleted": r.is_deleted,
         }
 
+
 class ConversationSerializer(serializers.Serializer):
     """
     Conversation list item.
@@ -105,14 +165,8 @@ class ConversationSerializer(serializers.Serializer):
     Expected context (all pre-computed by `list_conversations` in views.py):
       - viewer:           the requesting User
       - last_msg_map:     { conversation_id: latest Message instance }
-      - legacy_media_map: { message_id: media_type } -- for latest messages
-                          whose preview must come from MessageMedia rather
-                          than the legacy `media_type` column
+      - legacy_media_map: { message_id: media_type }
       - unread_map:       { conversation_id: int }
-
-    Each method has a safe fallback path so the serializer still works
-    when invoked outside of `list_conversations` (e.g. ad-hoc usage),
-    just at a higher query cost.
     """
     conversation_id = serializers.IntegerField(source='id')
     name            = serializers.CharField()
@@ -122,10 +176,7 @@ class ConversationSerializer(serializers.Serializer):
     avatar_user     = serializers.SerializerMethodField()
     unread_count    = serializers.SerializerMethodField()
 
-    # -- Helpers ----------------------------------------------------------
-
     def _participants_excluding_viewer(self, obj):
-        """Use the prefetched participants list when present (no extra query)."""
         viewer = self.context.get('viewer')
         if viewer is None:
             return list(obj.participants.all())
@@ -135,16 +186,12 @@ class ConversationSerializer(serializers.Serializer):
         cached_map = self.context.get('last_msg_map')
         if cached_map is not None:
             return cached_map.get(obj.id)
-        # Fallback -- not used by list_conversations, but keeps the
-        # serializer correct in standalone usage.
         return (
             obj.messages
-            .select_related('sender__userprofile')
+            .select_related('sender__userprofile', 'shared_post', 'shared_post__user')
             .order_by('-created_at')
             .first()
         )
-
-    # -- Fields -----------------------------------------------------------
 
     def get_name(self, obj):
         return obj.name or ""
@@ -162,6 +209,21 @@ class ConversationSerializer(serializers.Serializer):
             return ''
         if last.is_deleted:
             return '\U0001F6AB Message deleted'
+        # Shared-post preview: "You sent a post by <author>" /
+        # "<sender> sent a post by <author>". Checked BEFORE the text branch
+        # so a share with an optional caption still reads as a share in the
+        # inbox. The shared_post FK is select_related'd in list_conversations
+        # so this never issues a follow-up query.
+        if last.shared_post_id:
+            viewer = self.context.get('viewer')
+            author_name = (
+                last.shared_post.user.username
+                if last.shared_post and last.shared_post.user
+                else 'someone'
+            )
+            sender_is_viewer = viewer is not None and last.sender_id == viewer.id
+            who = 'You' if sender_is_viewer else last.sender.username
+            return f"{who} sent a post by {author_name}"
         if last.text:
             return last.text
         if last.media_type == 'image':

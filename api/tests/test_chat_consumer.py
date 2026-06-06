@@ -14,7 +14,7 @@ from django.test import TransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from api.jwt_middleware import JWTAuthMiddleware
-from api.models import Conversation
+from api.models import BlockedUser, Conversation
 from api.routing import websocket_urlpatterns
 
 # The auth + routing stack, minus the AllowedHostsOriginValidator (which would
@@ -66,3 +66,34 @@ class ChatConsumerAuthTests(TransactionTestCase):
             self.convo.id, subprotocols=["auth.token", token]
         )
         self.assertFalse(connected)
+
+    def test_blocker_rejected(self):
+        """L-1: the blocker can't open the socket either — parity with REST
+        get_messages, which 404s the conversation for both sides of a block."""
+        BlockedUser.objects.create(user=self.alice, blocked_user=self.bob)
+        token = _token_for(self.alice)
+        connected = async_to_sync(self._try_connect)(
+            self.convo.id, subprotocols=["auth.token", token]
+        )
+        self.assertFalse(connected)
+
+    def test_blocked_party_rejected(self):
+        """L-1: the blocked party can't open the socket, so they stop receiving
+        the blocker's typing / read / edit / delete broadcasts."""
+        BlockedUser.objects.create(user=self.alice, blocked_user=self.bob)
+        token = _token_for(self.bob)
+        connected = async_to_sync(self._try_connect)(
+            self.convo.id, subprotocols=["auth.token", token]
+        )
+        self.assertFalse(connected)
+
+    def test_unblocked_participant_still_connects(self):
+        """Guard against over-blocking: a block between alice and bob must not
+        affect an unrelated participant in the same (group) conversation."""
+        self.convo.participants.add(self.outsider)
+        BlockedUser.objects.create(user=self.alice, blocked_user=self.bob)
+        token = _token_for(self.outsider)
+        connected = async_to_sync(self._try_connect)(
+            self.convo.id, subprotocols=["auth.token", token]
+        )
+        self.assertTrue(connected)

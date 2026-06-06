@@ -5,7 +5,7 @@ from django.core.cache import cache
 from django.db.models import Exists, F, OuterRef, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -15,8 +15,9 @@ from ...services.feed_helpers import (
     get_muted_page_ids,
     likes_count_subquery, comments_count_subquery, saves_count_subquery,
 )
-from ...services.media import validate_image_upload
+from ...services.media import safe_image_filename, validate_image_upload
 from ...services.push import push_to_user
+from ...services.throttles import FollowRateThrottle
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -231,6 +232,14 @@ def get_page_detail(request):
                             if m.thumbnail else None
                         ),
                         "order": m.order,
+                        # Upload-time dims (nullable for legacy rows). The
+                        # PageFeed vertical scroll uses these to predict
+                        # per-post row height up-front so its initial
+                        # scroll-to-tapped-post lands on the right pixel
+                        # instead of estimating and snapping. Matches the
+                        # shape PostMediaSerializer exposes for the home feed.
+                        "width": m.width,
+                        "height": m.height,
                     }
                     for m in p.ordered_media
                 ],
@@ -280,6 +289,7 @@ def get_page_detail(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([FollowRateThrottle])
 def toggle_page_follow(request):
     page_id = request.data.get('page_id')
 
@@ -462,8 +472,14 @@ def update_page_avatar(request):
     except ValueError as e:
         return Response({"error": str(e)}, status=400)
 
-    page.avatar = avatar
-    page.save(update_fields=["avatar"])
+    # M6: persist with a SERVER-derived filename. Pre-fix, FileField
+    # took the client's chosen filename verbatim and the resulting
+    # public URL leaked it ("/media/page_avatars/<whatever-they-typed>.png").
+    # The bytes are already validated; we just stop trusting the *name*.
+    safe_name = safe_image_filename(
+        avatar, f"page_{page.id}_avatar",
+    )
+    page.avatar.save(safe_name, avatar, save=True)
 
     return Response({
         "status": "ok",
@@ -641,5 +657,35 @@ def update_page_settings(request):
 
     setattr(page, key, clean)
     page.save(update_fields=[key])
+
+    # H6: a visibility-affecting flip leaves the per-viewer feed caches
+    # stale until their 90s / 5min TTLs roll over -- meaning a viewer
+    # who was being SHOWN (or HIDDEN from) this page's posts based on
+    # the OLD flag value gets up to a few minutes of incorrect feeds.
+    # Invalidate for the page owner and every current follower so the
+    # next /feed/ load recomputes against the new state.
+    #
+    # `anyone_can_post` and `is_event` are excluded because they don't
+    # change who can SEE this page's content (they govern posting and
+    # display category, respectively). `description` / `event_date` /
+    # `event_time` / `event_location` are also visibility-neutral.
+    # A no-op flip (e.g. setting is_private=True when it was already
+    # True) does a redundant delete_many; the cost is trivial and not
+    # worth a diff-check around it. Mirrors the cache-invalidation
+    # pattern toggle_page_follow / toggle_page_mute already use for
+    # single-user invalidation, just fanned out over followers.
+    if key in {"is_private", "is_super_private", "chat_enabled"}:
+        affected_uids = set(
+            PageFollow.objects
+            .filter(page=page)
+            .values_list("user_id", flat=True)
+        )
+        affected_uids.add(page.owner_id)
+        cache_keys = []
+        for uid in affected_uids:
+            cache_keys.append(f"feed_ctx:{uid}")
+            cache_keys.append(f"suggested_feed_scores:{uid}")
+        if cache_keys:
+            cache.delete_many(cache_keys)
 
     return Response({"status": "ok"})

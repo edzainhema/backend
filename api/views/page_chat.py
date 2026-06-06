@@ -3,7 +3,7 @@ import mimetypes
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 
-from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes, throttle_classes
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -12,11 +12,22 @@ from ..models import (
     BlockedUser, Page, PageChatMessage, PageChatMessageMedia, PageFollow,
 )
 from ..services.activity import log_activity
+from ..services.chat import MAX_FILES_PER_MESSAGE
+from ..services.media import validate_uploaded_media_file
+from ..services.throttles import SendMessageRateThrottle
 
 
 def _page_chat_member_or_403(user, page):
-    """Return None if `user` is the page owner or a follower, else a 403."""
+    """Return None if `user` may access this page's chat, else a 403.
+
+    Public pages: anyone authenticated can view/post in the chat (subject to
+    the page's `chat_enabled` flag and block filtering, which the callers
+    already enforce). The followers-only rule applies ONLY to private and
+    super-private pages, where the page itself isn't visible to non-followers.
+    """
     if page.owner_id == user.id:
+        return None
+    if not (page.is_private or page.is_super_private):
         return None
     if PageFollow.objects.filter(user=user, page=page).exists():
         return None
@@ -34,7 +45,17 @@ def _safe_build_url(request, file_field):
 
 
 def _detect_media_type(uploaded):
-    """Map an uploaded file to ('image' | 'video' | 'audio') or None."""
+    """Best-effort classification from the Content-Type / filename hint
+    ONLY. Kept for the legacy callsites and the reply-preview path that
+    needs a "what kind of attachment is this" answer without running the
+    full safety pipeline.
+
+    The new send-message flow does NOT use this -- it routes every file
+    through `validate_uploaded_media_file` (audit B5) instead, which
+    re-derives the kind from the file's magic bytes after the
+    Content-Type sniff. This helper stays for the read-side callers
+    that just want a label.
+    """
     mime = getattr(uploaded, "content_type", "") or (
         mimetypes.guess_type(getattr(uploaded, "name", "") or "")[0] or ""
     )
@@ -259,6 +280,7 @@ def list_page_chat_messages(request):
 @api_view(["POST"])
 @parser_classes([MultiPartParser, FormParser, JSONParser])
 @permission_classes([IsAuthenticated])
+@throttle_classes([SendMessageRateThrottle])
 def send_page_chat_message(request):
     """
     Multipart or JSON:
@@ -283,15 +305,24 @@ def send_page_chat_message(request):
         return Response({"error": "text is too long (max 4000 chars)"}, status=400)
 
     # Prefer indexed media_0,1,2,... ; fall back to single `media`.
+    # H5: bound the collection loop at MAX_FILES_PER_MESSAGE + 1 so we
+    # iterate at most one slot beyond the cap, then explicitly reject
+    # if another slot exists past that. Without this, a client posting
+    # media_0..media_99 would push 100 files through the upload
+    # handler before any per-endpoint validation. The cap matches
+    # the one DM send uses (and posts/create.py).
     single_media = request.FILES.get("media")
     indexed_media = []
-    i = 0
-    while True:
+    for i in range(MAX_FILES_PER_MESSAGE):
         f = request.FILES.get(f"media_{i}")
         if f is None:
             break
         indexed_media.append(f)
-        i += 1
+    if request.FILES.get(f"media_{MAX_FILES_PER_MESSAGE}") is not None:
+        return Response(
+            {"error": f"Too many attachments (max {MAX_FILES_PER_MESSAGE})."},
+            status=400,
+        )
 
     if indexed_media:
         media_files = indexed_media
@@ -303,15 +334,24 @@ def send_page_chat_message(request):
     if not text and not media_files:
         return Response({"error": "Message empty"}, status=400)
 
+    # B5: route every attachment through the same upload-safety pipeline
+    # post / comment / DM uploads use -- size cap, magic-byte verification
+    # for image/video/audio, decompression-bomb guard for images. Page
+    # chat previously only checked the client's Content-Type header,
+    # which is freely spoofable; an attacker could attach a 2 GB file
+    # labelled `image/png` and the bytes would land in
+    # `media/page_chat_media/` unchallenged. The validator returns the
+    # detected kind, which we use directly so we don't have to re-detect.
     typed_files = []
     for f in media_files:
-        t = _detect_media_type(f)
-        if t is None:
-            return Response(
-                {"error": f"Unsupported media type: {getattr(f, 'name', 'upload')}"},
-                status=400,
+        try:
+            kind = validate_uploaded_media_file(
+                f, allow_kinds=('image', 'video', 'audio'),
             )
-        typed_files.append((f, t))
+        except ValueError as exc:
+            name = getattr(f, 'name', 'upload')
+            return Response({"error": f"{name}: {exc}"}, status=400)
+        typed_files.append((f, kind))
 
     page = get_object_or_404(Page, id=page_id)
     if not page.chat_enabled:

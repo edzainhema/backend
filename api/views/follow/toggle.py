@@ -4,16 +4,18 @@ requests for private accounts, and the notify/push fan-out."""
 
 from django.contrib.auth.models import User
 from django.core.cache import cache
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ...models import BlockedUser, Follow, FollowRequest, Notification
 from ...services.push import push_to_user
+from ...services.throttles import FollowRateThrottle
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([FollowRateThrottle])
 def toggle_follow(request):
     target_user_id = request.data.get("user_id")
 

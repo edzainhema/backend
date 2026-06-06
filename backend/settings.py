@@ -194,6 +194,14 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework_simplejwt',
+    # Token blacklist app — backs /auth/logout/ and BLACKLIST_AFTER_ROTATION.
+    # Without this, logout is a client-side memory wipe only: the server keeps
+    # honoring the refresh token for its full lifetime (REFRESH_TOKEN_LIFETIME
+    # below), and ROTATE_REFRESH_TOKENS is cosmetic — old jtis remain valid
+    # after rotation. With it installed and BLACKLIST_AFTER_ROTATION=True,
+    # /auth/logout/ revokes server-side, and a refresh you've rotated past
+    # can't mint another access token.
+    'rest_framework_simplejwt.token_blacklist',
     'channels',
     'corsheaders',
     'api',
@@ -319,10 +327,75 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    # ---------------------------------------------------------------------
+    # Rate limiting (audit B4).
+    # ---------------------------------------------------------------------
+    # Two layers:
+    #
+    #   1. Global defaults that catch every endpoint with no per-view
+    #      config. `anon` keys on REMOTE_ADDR for unauthenticated requests;
+    #      `user` keys on user.pk when authenticated, REMOTE_ADDR otherwise.
+    #      The defaults are intentionally generous so they only fire on
+    #      genuine flooding -- per-endpoint scopes (below) provide the
+    #      tighter caps where they matter.
+    #
+    #   2. Per-scope rates referenced by the throttle subclasses in
+    #      `api/services/throttles.py`. Each subclass declares a `scope`
+    #      attribute matching one of the keys below; DRF reads the rate
+    #      from this dict at request time.
+    #
+    # Counters live in `caches['default']` (Redis in production, LocMem
+    # in single-process dev -- see INF-2). Behind nginx, the per-IP key
+    # is only correct when nginx forwards X-Forwarded-For AND Django
+    # promotes it to REMOTE_ADDR; see the note in services/throttles.py.
+    # ---------------------------------------------------------------------
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        # Global safety nets.
+        'anon': '60/min',
+        'user': '600/min',
+
+        # Anonymous / auth-entry scopes.
+        'auth_login':              '10/min',
+        'auth_register':           '5/min',
+        'auth_social':             '10/min',
+        'auth_logout':             '30/min',
+        'password_reset_request':  '3/min',
+        'password_reset_confirm':  '10/min',
+        'email_verification_request': '3/min',
+        'email_verification_confirm': '10/min',
+
+        # Authenticated write scopes. Tuned generous enough for normal
+        # use (a real user tapping like across the feed, sending a
+        # burst of DMs, etc.) and tight enough to bound push-fanout
+        # abuse and notification spam.
+        'follow':                  '60/min',
+        'send_message':            '60/min',
+        'post_create':             '20/min',
+        'comment_create':          '30/min',
+        'post_engagement':         '120/min',
+        'report':                  '10/min',
+        'page_invite':             '30/min',
+    },
 }
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # B4: promote X-Forwarded-For -> REMOTE_ADDR before any downstream
+    # middleware or view reads the client IP. DRF's AnonRateThrottle
+    # keys on REMOTE_ADDR; behind nginx without this, every anonymous
+    # request looks like it's coming from the nginx host's loopback IP
+    # and the per-IP buckets collapse into one global bucket per scope
+    # (a self-DoS). The middleware trusts XFF unconditionally because
+    # nginx is the only public-facing layer in this deployment -- same
+    # assumption SECURE_PROXY_SSL_HEADER below already makes for
+    # X-Forwarded-Proto. See api/middleware.py:RealClientIPMiddleware
+    # for the trust-model write-up and what to change if Django is
+    # ever exposed without a trusted proxy in front.
+    'api.middleware.RealClientIPMiddleware',
     # CorsMiddleware must be placed AS HIGH AS POSSIBLE (per django-cors-headers
     # docs) — definitely before CommonMiddleware and any middleware that can
     # generate responses. It adds the Access-Control-Allow-* headers to
@@ -464,6 +537,9 @@ AUTH_PASSWORD_VALIDATORS = [
     },
     {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        'OPTIONS': {
+            'min_length': 10,
+        },
     },
     {
         'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
@@ -507,7 +583,12 @@ SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=60),
     'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': False,  # set True only if you add simplejwt blacklist app
+    # The blacklist app is in INSTALLED_APPS above, so rotation now actually
+    # invalidates the old refresh token (simplejwt only enforces "this jti was
+    # rotated" when the blacklist app is installed). Combined with /auth/logout/
+    # blacklisting on demand, this closes the "stolen refresh token works for
+    # 60 days" hole. See audit B2.
+    'BLACKLIST_AFTER_ROTATION': True,
 }
 
 
@@ -615,6 +696,25 @@ DEFAULT_FROM_EMAIL = os.environ.get(
 SERVER_EMAIL = os.environ.get(
     "SERVER_EMAIL", "noreply@here-social.com"
 )
+
+
+# ---------------------------------------------------------------------------
+# Moderation escalation (audit H4). When a report is filed, services/moderation
+# fires an alert (off the request path, via the notify_moderation Celery task)
+# so reports don't sit unseen in Django admin. Both channels are OPTIONAL: with
+# neither set, reports still persist and appear in admin — there's just no push
+# alert. Set at least one before a public launch with safety obligations.
+#   * MODERATION_EMAIL — address that receives report alerts (uses the SES
+#     backend above). e.g. "trust@here-social.com".
+#   * MODERATION_SLACK_WEBHOOK_URL — incoming-webhook URL for a #moderation
+#     channel.
+#   * MODERATION_ALERT_COOLDOWN_S — coalesce a flood of reports against one
+#     target into one alert per window (severe reasons use a separate window),
+#     so a brigade can't melt the channel. 0 disables coalescing.
+# ---------------------------------------------------------------------------
+MODERATION_EMAIL = os.environ.get("MODERATION_EMAIL", "")
+MODERATION_SLACK_WEBHOOK_URL = os.environ.get("MODERATION_SLACK_WEBHOOK_URL", "")
+MODERATION_ALERT_COOLDOWN_S = int(os.environ.get("MODERATION_ALERT_COOLDOWN_S", "600"))
 
 
 # ---------------------------------------------------------------------------

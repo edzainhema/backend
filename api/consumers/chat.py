@@ -41,6 +41,20 @@ class ChatConsumer(BaseMessagingConsumer):
             await self.close(code=4403)
             return
 
+        # L-1: refuse the socket when a block (either direction) exists with any
+        # other participant, mirroring the REST get_messages 404. New-message
+        # creation is already block-gated in create_chat_message, but without
+        # this the open connection still leaks typing / read / edit / delete
+        # broadcasts across the block. Same 4403 close code as non-membership —
+        # a blocked viewer should not be able to tell "blocked" from "not a
+        # participant".
+        blocked = await database_sync_to_async(chat_service.is_blocked_in_conversation)(
+            user.id, self.conversation_id
+        )
+        if blocked:
+            await self.close(code=4403)
+            return
+
         # WS-4: decide ONCE (not per event) whether this conversation is large
         # enough to suppress typing / read-receipt broadcasts. Participant
         # count changes rarely, so a slightly stale value is fine for a

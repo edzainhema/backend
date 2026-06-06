@@ -2,14 +2,19 @@
 
 
 from django.contrib.auth.models import User
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from ...models import UserProfile
 from ...serializers import UserProfileSerializer
-from ...services.auth_helpers import _looks_like_email
-from ...services.media import validate_image_upload
+from ...services.auth_helpers import (
+    _looks_like_email, _looks_like_phone, _normalize_phone,
+)
+from ...services.email_verification import send_verification_email
+from ...services.media import safe_image_filename, validate_image_upload
 
 
 @api_view(["POST"])
@@ -52,10 +57,37 @@ def update_profile_settings(request):
             "last_name", ""
         ).strip()
 
+    # --------------------------------------------------
+    # 📞 PHONE NUMBER (audit H4)
+    # --------------------------------------------------
+    # Phone is a login identifier (`_find_user_by_identifier` resolves it),
+    # so updates must mirror the rules `register_user` enforces:
+    #   1. validate the format -- otherwise an invalid string lives in the
+    #      profile and breaks `_find_user_by_identifier`;
+    #   2. normalise via `_normalize_phone` so "+1 555-123-4567" and
+    #      "+15551234567" can't both exist as two distinct rows pointing
+    #      at the same human;
+    #   3. uniqueness-check against OTHER users so a fat-fingered or
+    #      malicious update can't claim another account's phone (the
+    #      collision would otherwise let the wrong user sign in via phone).
+    # An empty input clears the phone. The unique constraint added by
+    # migration 0099 is the DB-level backstop -- the catch below maps
+    # the resulting IntegrityError to a 400.
     if "phone_number" in request.data:
-        profile.phone_number = request.data.get(
-            "phone_number", ""
-        ).strip()
+        raw_phone = (request.data.get("phone_number") or "").strip()
+        if raw_phone:
+            if not _looks_like_phone(raw_phone):
+                return Response({"error": "Invalid phone number"}, status=400)
+            normalized = _normalize_phone(raw_phone)
+            if UserProfile.objects.exclude(
+                user=user
+            ).filter(phone_number=normalized).exists():
+                return Response(
+                    {"error": "Phone number already in use"}, status=400,
+                )
+            profile.phone_number = normalized
+        else:
+            profile.phone_number = ""
 
     if "bio" in request.data:
         profile.bio = request.data.get(
@@ -66,6 +98,11 @@ def update_profile_settings(request):
     # ✉️ EMAIL
     # --------------------------------------------------
 
+    # Track whether the email is actually changing so we can clear
+    # `email_verified` and trigger a fresh verification mail AFTER
+    # the save (M5). Reading user.email pre-mutation captures the
+    # original value cleanly.
+    email_changed_to = None
     if "email" in request.data:
         email = (request.data.get("email") or "").strip()
 
@@ -88,6 +125,15 @@ def update_profile_settings(request):
                     {"error": "Email already in use"},
                     status=400
                 )
+
+        if email != (user.email or ""):
+            email_changed_to = email
+            # M5: a fresh email means the old `email_verified` flag no
+            # longer applies. Clear it BEFORE the save so we never have
+            # a window where `user.email = new` + `profile.email_verified
+            # = True (stale)` is visible -- any reader could mistakenly
+            # treat the new address as verified.
+            profile.email_verified = False
 
         user.email = email
 
@@ -139,8 +185,52 @@ def update_profile_settings(request):
     # --------------------------------------------------
     # 💾 PERSIST + RETURN THE UPDATED PROFILE
     # --------------------------------------------------
-    profile.save()
-    user.save()
+    # H3: wrap both saves in atomic + IntegrityError catch. The
+    # application-layer pre-checks above (email / username / phone)
+    # are TOCTOU-racy with the saves; another request can grab the
+    # identifier in the window between check and save. The DB
+    # constraints from migration 0099 make the losing request raise
+    # IntegrityError -- without this catch that becomes a 500. The
+    # atomic() also keeps `profile.save()` and `user.save()` together:
+    # if the second fails, the first rolls back so we don't half-save
+    # the update.
+    try:
+        with transaction.atomic():
+            profile.save()
+            user.save()
+    except IntegrityError:
+        # Re-check to identify which field collided so the client gets
+        # a useful message instead of a generic 500.
+        if User.objects.exclude(
+            id=user.id
+        ).filter(username__iexact=user.username).exists():
+            return Response({"error": "Username already taken"}, status=400)
+        if user.email and User.objects.exclude(
+            id=user.id
+        ).filter(email__iexact=user.email).exists():
+            return Response({"error": "Email already in use"}, status=400)
+        if profile.phone_number and UserProfile.objects.exclude(
+            user=user
+        ).filter(phone_number=profile.phone_number).exists():
+            return Response(
+                {"error": "Phone number already in use"}, status=400,
+            )
+        return Response(
+            {"error": "Could not save changes, please try again."},
+            status=409,
+        )
+
+    # M5: now that the new email is committed AND `email_verified` is
+    # already cleared (above), send the verification mail to the new
+    # address. AFTER the atomic block so a flaky SES can't roll back
+    # an otherwise-successful settings update. Best-effort -- the
+    # service silently no-ops on no-email-on-file / inactive / already
+    # verified branches, and we swallow any send failure.
+    if email_changed_to:
+        try:
+            send_verification_email(user)
+        except Exception:
+            pass
 
     return Response(
         UserProfileSerializer(profile, context={"request": request}).data
@@ -172,8 +262,18 @@ def update_profile_avatar(request):
     except ValueError as exc:
         return Response({"error": str(exc)}, status=400)
 
-    profile.avatar = avatar
-    profile.save(update_fields=["avatar"])
+    # M6: persist with a SERVER-derived filename instead of the
+    # client-supplied one. Without this, FileField stored whatever
+    # the multipart field carried -- so avatar URLs ended up like
+    # `/media/avatars/<whatever-the-client-typed>.png`, leaking
+    # arbitrary client strings into the public URL. The bytes were
+    # already validated upstream; we just no longer trust the *name*.
+    # `safe_image_filename` derives the extension from the file's
+    # actual bytes via a Pillow probe, so `.png` always means PNG.
+    safe_name = safe_image_filename(
+        avatar, f"profile_{request.user.id}_avatar",
+    )
+    profile.avatar.save(safe_name, avatar, save=True)
 
     avatar_url = (
         request.build_absolute_uri(profile.avatar.url)

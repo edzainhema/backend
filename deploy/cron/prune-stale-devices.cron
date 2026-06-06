@@ -1,0 +1,29 @@
+# Daily reaping of stale push-notification Device rows (audit H3 / L7).
+#
+# An FCM token is unique per app INSTALL, not per account. register_device bumps
+# Device.last_seen on every login / app foreground, so an account that logs out
+# stops refreshing its (account, token) row. Left in place, that stale row keeps
+# delivering the logged-out account's push notifications to whoever now holds the
+# physical device — a cross-account notification leak. This job is the proactive
+# backstop for when the client's own /auth/unregister-device/ call doesn't land
+# (crash / offline / force-quit), complementing FCM's dead-token pruning in
+# services/push.py.
+#
+# Multi-account safe: it only deletes rows the owning account itself stopped
+# refreshing (per user+token), never a token-wide delete, so two accounts on one
+# phone are untouched as long as the live one keeps registering.
+#
+# ── Install (Linux cron) ─────────────────────────────────────────────────
+# Replace the path with your deployment path, then load it under the user that
+# owns the app (so file/venv permissions match):
+#
+#     ( crontab -l 2>/dev/null; \
+#       echo '23 4 * * * cd /srv/here-social/backend && /srv/here-social/backend/venv/bin/python manage.py prune_stale_devices' \
+#     ) | crontab -
+#
+# Verify with:  crontab -l
+#
+# Tune the window with --max-age-days N (default 60). Use --dry-run to preview
+# the count without deleting:
+#
+#     python manage.py prune_stale_devices --max-age-days 60 --dry-run

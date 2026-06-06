@@ -10,7 +10,7 @@ from django.db import transaction
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -22,12 +22,15 @@ from ...services.push import push_to_user
 from ...services.comment_analyzer import analyze_comment, extract_hashtags
 from ...services.feed_helpers import viewer_can_see_post
 from ...services.media import (
-    IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, verify_uploaded_media,
+    IMAGE_MAX_BYTES, VIDEO_MAX_BYTES,
+    validate_uploaded_media_file, verify_uploaded_media,
 )
+from ...services.throttles import CommentCreateRateThrottle
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([CommentCreateRateThrottle])
 def create_comment(request):
     post_id = request.data.get("post_id")
     parent_id = request.data.get("parent_id")
@@ -81,44 +84,21 @@ def create_comment(request):
         while parent.parent_id is not None:
             parent = parent.parent
 
-    # File validation: content-type, size, magic bytes. Mirrors posts.py.
+    # File validation: routed through the shared upload-safety pipeline
+    # (audit B5). Comments accept image + video; no audio attachments
+    # here. The validator handles header type-check, filename agreement,
+    # per-kind size cap, magic-byte sniff, and Pillow's
+    # decompression-bomb guard in one call.
     if file:
-        client_ct = (file.content_type or '').lower()
-        guessed_ct = (mimetypes.guess_type(file.name or '')[0] or '').lower()
-        is_image_ct = client_ct.startswith('image/')
-        is_video_ct = client_ct.startswith('video/')
-
-        if not (is_image_ct or is_video_ct):
-            return Response(
-                {'error': f'Unsupported file type: {client_ct or "unknown"}'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if guessed_ct and not guessed_ct.startswith(client_ct.split('/')[0]):
-            return Response(
-                {'error': f'Content-type does not match filename: {file.name}'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        size_cap = IMAGE_MAX_BYTES if is_image_ct else VIDEO_MAX_BYTES
-        if file.size is not None and file.size > size_cap:
-            limit_mb = size_cap // (1024 * 1024)
-            kind_label = 'Image' if is_image_ct else 'Video'
-            return Response(
-                {'error': f'{kind_label} exceeds the {limit_mb} MB limit.'},
-                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            )
-
         try:
-            verify_uploaded_media(
-                file,
-                claimed_kind='image' if is_image_ct else 'video',
+            validate_uploaded_media_file(file, allow_kinds=('image', 'video'))
+        except ValueError as exc:
+            code = (
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                if 'exceeds' in str(exc)
+                else status.HTTP_400_BAD_REQUEST
             )
-        except ValueError as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({'error': str(exc)}, status=code)
 
     # Wrap comment + side effects in a single transaction. Roll back if any
     # step raises so we never persist a half-saved comment.

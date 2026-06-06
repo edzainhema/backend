@@ -9,17 +9,18 @@ import re
 from PIL import Image
 from django.contrib.auth.models import User
 from django.core.cache import cache
-from django.db import transaction
+from django.db import models, transaction
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from ...models import BlockedUser, Follow, Notification, Page, PagePoster, Post, PostMedia
+from ...models import BlockedUser, Follow, Notification, Page, PagePoster, Post, PostMedia, PostMediaTag
 from ...serializers import ProfilePostSerializer
-from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image, process_media_video, verify_uploaded_media
+from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image, process_media_video, validate_uploaded_media_file, verify_uploaded_media
 from ...services.push import push_to_user
 from ...services.hashtags import sync_post_hashtags
+from ...services.throttles import PostCreateRateThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,47 @@ def _image_dimensions(file_like):
             file_like.seek(0)
         except Exception:
             pass
+
+
+def _parse_tagged_user_ids(request, idx):
+    """Read and sanitise the per-media ``tagged_user_ids_{idx}`` field.
+
+    Frontend sends a JSON array of ints (the user IDs the uploader picked in
+    TagUsersModal). We validate it lightly here — JSON-decode, drop anything
+    that isn't an int, dedupe — and return a list of ids. Resolution of those
+    ids to actual User rows (with block / self-tag filtering) happens later,
+    after the post + media rows exist. A missing/malformed field returns ``[]``
+    so the caller can treat "no tags" and "couldn't parse tags" identically:
+    a tag is a best-effort signal, never a reason to 400 the upload.
+    """
+    raw = request.data.get(f'tagged_user_ids_{idx}', None)
+    if raw in (None, ''):
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    out = []
+    seen = set()
+    for v in decoded:
+        # Accept ints and numeric strings; reject anything else (booleans,
+        # nested objects, NaN-like floats). Coercing through ``int(str)``
+        # would silently accept "12.5" -> ValueError; we'd rather drop.
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            uid = v
+        elif isinstance(v, str) and v.isdigit():
+            uid = int(v)
+        else:
+            continue
+        if uid <= 0 or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(uid)
+    return out
 
 
 def _process_media_files(request, files):
@@ -134,6 +176,11 @@ def _process_media_files(request, files):
             ),
             "width": width,
             "height": height,
+            # Pre-parsed list of user IDs the uploader tagged in THIS media.
+            # Parsed up-front (cheap, no DB) so the atomic-block path below
+            # only does row inserts. Resolved to actual User rows AFTER the
+            # transaction commits (notification fan-out is best-effort).
+            "tagged_user_ids": _parse_tagged_user_ids(request, idx),
         })
     return results
 
@@ -174,9 +221,15 @@ def _parse_upload_location(request):
 
 
 def _validate_per_file_upload(request, files):
-    """Validate each uploaded file (and any video thumbnail) up front:
-    type, size cap, and magic-byte content check. Returns an error
-    ``Response`` on the first bad file, or None if all files pass."""
+    """Validate each uploaded file (and any video thumbnail) up front via
+    the shared `validate_uploaded_media_file` pipeline (audit B5).
+
+    Posts accept image + video; audio attachments aren't a thing here.
+    The shared validator handles: header type-check, filename / header
+    agreement, per-kind size cap, magic-byte sniff, and (for images)
+    Pillow's decompression-bomb guard. Returns an error ``Response`` on
+    the first bad file, or None if all files pass.
+    """
     # Cap thumbnails below full images, but with enough headroom for a
     # FULL-RESOLUTION frame. The client now extracts the thumbnail at the
     # clip's native resolution (so the thumbnail matches the video instead of
@@ -189,56 +242,21 @@ def _validate_per_file_upload(request, files):
     # arbitrary-file-upload hole from finding #3 in UPLOAD_BUG_AUDIT.md — it
     # only allows a larger *image*.
     THUMBNAIL_MAX_BYTES = 15 * 1024 * 1024  # 15 MB
-    # ── Validate file size, type, and content up front ────────────────
-    # The client's Content-Type header is freely spoofable, so we use it
-    # only to pick a verifier (image vs video) and then confirm the bytes
-    # actually match — Pillow.verify() for images, magic-byte sniff for
-    # videos. We also enforce per-file size caps before any expensive
-    # processing, so a malicious or buggy client can't DoS the server
-    # with a huge or bomb-style file.
     for idx, f in enumerate(files):
-        client_ct = (f.content_type or '').lower()
-        guessed_ct = (mimetypes.guess_type(f.name or '')[0] or '').lower()
-        is_image_ct = client_ct.startswith('image/')
-        is_video_ct = client_ct.startswith('video/')
-        if not (is_image_ct or is_video_ct):
-            return Response(
-                {'error': f'Unsupported file type: {client_ct or "unknown"}'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        # Best-effort sanity check against the filename. If the extension
-        # is unknown (no guess) we let it pass — some camera URIs lack one.
-        if guessed_ct and not guessed_ct.startswith(client_ct.split('/')[0]):
-            return Response(
-                {'error': f'Content-type does not match filename: {f.name}'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Per-file size cap. f.size is set by Django's upload handler from
-        # the multipart length, so this rejects before we spool the whole
-        # file to disk or run FFmpeg / Pillow on it.
-        size_cap = IMAGE_MAX_BYTES if is_image_ct else VIDEO_MAX_BYTES
-        if f.size is not None and f.size > size_cap:
-            limit_mb = size_cap // (1024 * 1024)
-            kind_label = 'Image' if is_image_ct else 'Video'
-            return Response(
-                {'error': f'{kind_label} exceeds the {limit_mb} MB limit.'},
-                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            )
-
-        # Magic-byte check — confirms the file's actual content matches
-        # its claimed type. Also catches Pillow decompression bombs via
-        # the MAX_IMAGE_PIXELS guard set at module load.
         try:
-            verify_uploaded_media(
+            kind = validate_uploaded_media_file(
                 f,
-                claimed_kind='image' if is_image_ct else 'video',
+                allow_kinds=('image', 'video'),
             )
-        except ValueError as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
+        except ValueError as exc:
+            # 413 (Request Entity Too Large) for size violations stays
+            # the conventional code; everything else maps to 400.
+            code = (
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                if 'exceeds' in str(exc)
+                else status.HTTP_400_BAD_REQUEST
             )
+            return Response({'error': str(exc)}, status=code)
 
         # Thumbnail validation. The client extracts a still frame for each
         # uploaded video and posts it under `thumbnail_{idx}`. The original
@@ -247,21 +265,23 @@ def _validate_per_file_upload(request, files):
         # file upload primitive. We validate it here, before the atomic
         # transaction opens, so a bad thumbnail 400s without leaving half
         # a Post + half its media rows behind.
-        if is_video_ct:
+        if kind == 'video':
             thumb = request.FILES.get(f'thumbnail_{idx}')
             if thumb is not None:
-                if thumb.size is not None and thumb.size > THUMBNAIL_MAX_BYTES:
-                    limit_mb = THUMBNAIL_MAX_BYTES // (1024 * 1024)
-                    return Response(
-                        {'error': f'Thumbnail exceeds the {limit_mb} MB limit.'},
-                        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    )
                 try:
-                    verify_uploaded_media(thumb, claimed_kind='image')
-                except ValueError as e:
+                    validate_uploaded_media_file(
+                        thumb,
+                        allow_kinds=('image',),
+                        max_bytes_by_kind={'image': THUMBNAIL_MAX_BYTES},
+                    )
+                except ValueError as exc:
+                    code = (
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                        if 'exceeds' in str(exc)
+                        else status.HTTP_400_BAD_REQUEST
+                    )
                     return Response(
-                        {'error': f'Invalid thumbnail: {e}'},
-                        status=status.HTTP_400_BAD_REQUEST,
+                        {'error': f'Invalid thumbnail: {exc}'}, status=code,
                     )
     return None
 
@@ -307,8 +327,57 @@ def _notify_post_mentions(request, post, description):
             )
 
 
+def _notify_post_tags(request, post):
+    """Notify every user who got tagged in any of this post's media.
+
+    Reads back the PostMediaTag rows created inside the atomic block (so we
+    pick up exactly the same set the DB persisted — already de-self-tagged
+    and block-filtered there) and dedupes across media: if a user is tagged
+    in two photos of the same post, we send exactly one notification + one
+    push, not two. Runs OUTSIDE the atomic block by design — notifications
+    are best-effort and we don't want a flaky FCM call to bubble up and
+    fail an otherwise-successful upload, matching the existing
+    _notify_post_mentions contract.
+    """
+    tagged_users = list(
+        User.objects.filter(
+            id__in=PostMediaTag.objects
+                .filter(media__post=post)
+                .values_list("user_id", flat=True)
+        ).distinct()
+    )
+    if not tagged_users:
+        return
+
+    for u in tagged_users:
+        Notification.objects.create(
+            recipient=u,
+            actor=request.user,
+            notification_type="post_tag",
+            media=post,
+        )
+        # M11: pass actor + (optional) page so push_to_user can skip
+        # this push when the tagged user has muted the poster or the
+        # page the post belongs to. The Notification ROW above still
+        # exists (the list view filters muted actors there too); this
+        # only suppresses the buzz.
+        push_to_user(
+            u,
+            title="You were tagged",
+            body=f"{request.user.username} tagged you in a post",
+            extra_data={
+                "type": "post_tag",
+                "post_id": post.id,
+                "actor_id": request.user.id,
+            },
+            actor=request.user,
+            page=post.page,
+        )
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([PostCreateRateThrottle])
 def create_post(request):
     description = request.data.get('description', '').strip()
     page_id = request.data.get('page_id', None)
@@ -442,6 +511,58 @@ def create_post(request):
                         if pm.thumbnail and pm.thumbnail.name:
                             written_file_paths.append(pm.thumbnail.name)
 
+                # Persist who the uploader tagged in this specific media item.
+                # We resolve the requested IDs to actual User rows here (one
+                # bulk query per media) and filter out:
+                #   - the uploader themselves (self-tag is meaningless and
+                #     would produce a useless self-notification)
+                #   - users that have a Block relationship in either
+                #     direction (privacy + harassment-prevention parity with
+                #     _notify_post_mentions)
+                # We DO NOT 404 / 400 unknown IDs — a tag is best-effort, so
+                # we just skip anything that doesn't resolve. The
+                # ``unique_together`` on (media, user) makes the create idempotent
+                # under client retries.
+                requested_ids = item.get("tagged_user_ids") or []
+                if requested_ids:
+                    eligible_users = list(
+                        User.objects.filter(id__in=requested_ids)
+                        .exclude(id=request.user.id)
+                    )
+                    if eligible_users:
+                        # Honour blocks in EITHER direction. .between() is
+                        # the single-pair shortcut; for a LIST of candidates
+                        # we spell out both directions with __in, mirroring
+                        # the Q-pair pattern .between() uses internally. One
+                        # bulk query, no N+1 across the candidate list.
+                        eligible_ids = [u.id for u in eligible_users]
+                        block_pairs = BlockedUser.objects.filter(
+                            models.Q(
+                                user=request.user,
+                                blocked_user_id__in=eligible_ids,
+                            )
+                            | models.Q(
+                                user_id__in=eligible_ids,
+                                blocked_user=request.user,
+                            )
+                        ).values_list("user_id", "blocked_user_id")
+                        skip_ids = {
+                            other_id
+                            for pair in block_pairs
+                            for other_id in pair
+                            if other_id != request.user.id
+                        }
+                        tagged_users_for_media = [
+                            u for u in eligible_users if u.id not in skip_ids
+                        ]
+                        PostMediaTag.objects.bulk_create(
+                            [
+                                PostMediaTag(media=pm, user=u)
+                                for u in tagged_users_for_media
+                            ],
+                            ignore_conflicts=True,
+                        )
+
                 created_media.append({
                     'id': pm.id,
                     'order': pm.order,
@@ -474,7 +595,9 @@ def create_post(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
+
     _notify_post_mentions(request, post, description)
+    _notify_post_tags(request, post)
 
     # Invalidate suggested feed caches for all followers so the new post
     # surfaces in their feed immediately rather than waiting for the 5-min TTL.

@@ -106,7 +106,60 @@ def send_push_notification(tokens, title, body, data=None):
 # Per-user push helper (multi-account aware)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def push_to_user(recipient, title, body, extra_data=None):
+def _recipient_has_muted(recipient_id, actor_id=None, page_id=None) -> bool:
+    """M11: return True if `recipient` has muted `actor` OR `page`.
+
+    Reads `MutedUser` / `MutedPage` directly -- no caching, since
+    a stale mute set would let unwanted pushes slip through and the
+    mute set is small per user. Either id may be None (skip that
+    check); if BOTH are None this returns False unconditionally.
+    """
+    from ..models import MutedPage, MutedUser
+    if actor_id is not None and MutedUser.objects.filter(
+        user_id=recipient_id, muted_user_id=actor_id,
+    ).exists():
+        return True
+    if page_id is not None and MutedPage.objects.filter(
+        user_id=recipient_id, page_id=page_id,
+    ).exists():
+        return True
+    return False
+
+
+def recipients_who_muted(recipient_ids, *, actor_id=None, page_id=None) -> set:
+    """M11 (bulk): of ``recipient_ids``, return the subset that has muted
+    ``actor`` (user) OR ``page`` — i.e. the recipients a push from this source
+    must SKIP.
+
+    This is the many-recipient counterpart to ``_recipient_has_muted``: ONE
+    query per non-None source (not one per recipient), so a chat fan-out can
+    drop muted recipients before enqueuing. It is deliberately the SAME rule as
+    ``_recipient_has_muted`` (which the single-recipient REST path applies via
+    ``push_to_user(actor=...)``) and lives right next to it, so the WebSocket
+    fan-out and the REST path can't drift on what "muted" means (audit H2).
+    Either id may be None to skip that side; both None → empty set.
+    """
+    from ..models import MutedPage, MutedUser
+    ids = [r for r in (recipient_ids or []) if r]
+    if not ids:
+        return set()
+    muted: set = set()
+    if actor_id is not None:
+        muted.update(
+            MutedUser.objects.filter(
+                user_id__in=ids, muted_user_id=actor_id,
+            ).values_list("user_id", flat=True)
+        )
+    if page_id is not None:
+        muted.update(
+            MutedPage.objects.filter(
+                user_id__in=ids, page_id=page_id,
+            ).values_list("user_id", flat=True)
+        )
+    return muted
+
+
+def push_to_user(recipient, title, body, extra_data=None, *, actor=None, page=None):
     """
     Queue a push notification to every device that has `recipient` registered,
     and return immediately (BACKEND_SCALING_AUDIT.md SY-2).
@@ -134,6 +187,17 @@ def push_to_user(recipient, title, body, extra_data=None):
     deep-link info like {"type": "follow_request", "actor_id": 7} that the
     frontend can act on when the notification is tapped. It must be
     JSON-serialisable (ids / strings), since Celery serialises task args.
+
+    `actor` / `page` (optional, kwarg-only) gate the push on the recipient's
+    mutes (audit M11). If passed, this helper checks `MutedUser` /
+    `MutedPage` BEFORE enqueuing the Celery task and silently returns
+    when the recipient has muted the actor or the page. Callers that
+    DON'T pass these params get the legacy behaviour (no mute check),
+    so this extension is backward-compatible. The audit's "Question:
+    is mute feed-only or feed+notifications?" resolves to
+    "feed+notifications" here -- the typical product semantics. Other
+    push sites can be migrated in the same shape if/when desired; the
+    audit only flagged `_push_new_message` and `_notify_post_tags`.
     """
     if recipient is None:
         return
@@ -141,6 +205,17 @@ def push_to_user(recipient, title, body, extra_data=None):
     recipient_id = getattr(recipient, "id", None)
     if recipient_id is None:
         return
+
+    # M11: bail before enqueuing if the recipient has muted the actor
+    # or the page. Cheap check; saves the Celery task overhead + the
+    # FCM round trip for every muted-source push.
+    if actor is not None or page is not None:
+        actor_id = getattr(actor, "id", None) if actor is not None else None
+        page_id = getattr(page, "id", None) if page is not None else None
+        if _recipient_has_muted(
+            recipient_id, actor_id=actor_id, page_id=page_id,
+        ):
+            return
 
     # Imported lazily to avoid a circular import at module load (tasks.py
     # imports back into utils inside its task bodies).

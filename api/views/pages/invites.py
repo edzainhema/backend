@@ -6,13 +6,14 @@ from django.core.cache import cache
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_datetime
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from ...models import BlockedUser, Notification, Page, PageFollow, PageInvite
 from ...services.push import push_to_user
 from ...services.pagination import decode_cursor, encode_cursor
+from ...services.throttles import PageInviteRateThrottle
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -180,6 +181,7 @@ def search_users_for_page_invite(request):
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([PageInviteRateThrottle])
 def invite_to_page(request):
     """
     Admin sends a page invite to a user.

@@ -10,7 +10,7 @@ from django.utils import timezone
 from ...models import Post, RecommendedAuthor
 from ...services.feed_helpers import post_visibility_q
 from ..constants import COLLABORATIVE_HALF_LIFE_DAYS, COLLABORATIVE_MAX_PER_AUTHOR, COLLABORATIVE_POOL, COLLABORATIVE_TOP_AUTHORS, COLLABORATIVE_TTL_S, COLLABORATIVE_WINDOW_DAYS
-from ..scoring import _annotate_for_serialize, _engagement_score, _exclude_not_interested, recency_decay_days
+from ..scoring import _annotate_for_serialize, _engagement_score, _exclude_not_interested, recency_decay_days, rehydrate_visible_slice
 
 # =============================================================================
 # RAIL (e) — Collaborative ("people like you")
@@ -104,20 +104,11 @@ def _rail_collaborative(request, user, context, *, offset: int, limit: int,
                 break
         return out[offset:offset + limit]
 
-    # Cache hit.
-    wanted_ids = [
-        pid for pid, _ in scored
-        if pid not in exclude_ids
-    ][offset:offset + limit]
-    if not wanted_ids:
-        return []
-    posts = list(
-        _annotate_for_serialize(Post.objects.filter(id__in=wanted_ids), user)
+    # Cache hit — re-apply the per-viewer visibility/block/mute/not-interested
+    # gate at fetch time (audit H1). The cached score list was filtered at build
+    # time, but it lives for COLLABORATIVE_TTL_S and visibility isn't static over
+    # that window. Shared helper so the rails can't drift.
+    return rehydrate_visible_slice(
+        scored, user=user, context=context,
+        exclude_ids=exclude_ids, offset=offset, limit=limit,
     )
-    post_map = {p.id: p for p in posts}
-    score_map = dict(scored)
-    return [
-        (pid, score_map[pid], post_map[pid])
-        for pid in wanted_ids
-        if pid in post_map
-    ]

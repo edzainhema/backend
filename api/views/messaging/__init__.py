@@ -5,6 +5,9 @@ from .conversations import (
     start_conversation,
     start_group_conversation,
     list_conversations,
+    list_message_requests,
+    accept_message_request,
+    decline_message_request,
     delete_conversation,
     rename_conversation,
     search_message_users,
@@ -20,6 +23,10 @@ from .reactions import (
     _reaction_summary,
     react_to_message,
 )
+from .share import (
+    list_share_recipients,
+    share_post_to_users,
+)
 
 __all__ = [
     "_reaction_summary",
@@ -29,10 +36,15 @@ __all__ = [
     "send_message",
     "get_messages",
     "list_conversations",
+    "list_message_requests",
+    "accept_message_request",
+    "decline_message_request",
     "delete_conversation",
     "react_to_message",
     "edit_message",
     "delete_message",
     "rename_conversation",
     "search_message_users",
+    "list_share_recipients",
+    "share_post_to_users",
 ]

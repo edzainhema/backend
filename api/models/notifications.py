@@ -17,6 +17,11 @@ class Notification(models.Model):
         ("comment_reply",         "Comment Reply"),
         ("comment_like",          "Comment Like"),
         ("mention",               "Mention"),
+        # User was tagged in an image/video via the upload sheet's tag-people
+        # picker. Distinct from "mention" (which scans the description for
+        # @handles) -- a tag is an explicit per-media association created from
+        # PostMediaTag rows on post create.
+        ("post_tag",              "Post Tag"),
         ("page_invite",           "Page Invite"),
         ("page_follow",           "Page Follow"),
         ("page_follow_request",   "Page Follow Request"),
@@ -52,4 +57,4 @@ class Notification(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.actor.username} → {self.recipient.username} ({self.notification_type})"
+        return f"{self.actor.username} -> {self.recipient.username} ({self.notification_type})"

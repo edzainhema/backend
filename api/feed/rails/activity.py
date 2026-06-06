@@ -12,11 +12,11 @@ from ...models import Post, PostHashtag
 from ...services.feed_helpers import post_visibility_q
 from ..affinity import _build_activity_profile
 from ..constants import ACTIVITY_COLD_START_EVENTS, ACTIVITY_COLD_START_MIN_SCALE, ACTIVITY_HALF_LIFE_DAYS, ACTIVITY_MAX_PER_AUTHOR, ACTIVITY_MIN_CONTENT, ACTIVITY_MIN_SCORE, ACTIVITY_POOL, ACTIVITY_SCORES_TTL_S, ACTIVITY_TOD_BOOST, ACTIVITY_WINDOW_DAYS, TRENDING_HASHTAG_BOOST
-from ..scoring import _annotate_for_serialize, _engagement_score, _exclude_not_interested, recency_decay_days
+from ..scoring import _annotate_for_serialize, _engagement_score, _exclude_not_interested, recency_decay_days, rehydrate_visible_slice
 from ..trending import get_trending_hashtags
 
 def _rail_activity(request, user, context, *, offset: int, limit: int,
-                   exclude_ids: set[int]):
+                   exclude_ids: set[int], profile=None):
     """
     Returns [(post_id, score, post_obj), ...] for posts ranked by the
     viewer's affinity profile.
@@ -30,7 +30,12 @@ def _rail_activity(request, user, context, *, offset: int, limit: int,
     Scoring also gets a time-of-day boost (B6): content matching the viewer's
     interests in the current 6-hour slice of day ranks a little higher.
     """
-    profile = _build_activity_profile(user)
+    # L10: compose_home_feed_page already loaded this profile for the slot
+    # layout — reuse it to save a second Redis round-trip + deserialise. Falls
+    # back to its own fetch when called standalone, or when compose passed an
+    # empty dict (its build-failed path), so behaviour is unchanged either way.
+    if not profile:
+        profile = _build_activity_profile(user)
     cold_start_scale = min(profile["n_events"] / ACTIVITY_COLD_START_EVENTS, 1.0)
     if cold_start_scale < ACTIVITY_COLD_START_MIN_SCALE:
         return []
@@ -212,20 +217,11 @@ def _rail_activity(request, user, context, *, offset: int, limit: int,
                 break
         return out[offset:offset + limit]
 
-    # Cache hit.
-    wanted_ids = [
-        pid for pid, _ in scored
-        if pid not in exclude_ids
-    ][offset:offset + limit]
-    if not wanted_ids:
-        return []
-    posts = list(
-        _annotate_for_serialize(Post.objects.filter(id__in=wanted_ids), user)
+    # Cache hit — re-apply the per-viewer visibility/block/mute/not-interested
+    # gate at fetch time (audit H1). The cached score list was filtered when it
+    # was built, but it lives for ACTIVITY_SCORES_TTL_S and visibility isn't
+    # static over that window. Shared helper so the rails can't drift.
+    return rehydrate_visible_slice(
+        scored, user=user, context=context,
+        exclude_ids=exclude_ids, offset=offset, limit=limit,
     )
-    post_map = {p.id: p for p in posts}
-    score_map = dict(scored)
-    return [
-        (pid, score_map[pid], post_map[pid])
-        for pid in wanted_ids
-        if pid in post_map
-    ]

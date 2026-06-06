@@ -65,12 +65,40 @@ are safe to call everywhere today; they become truly asynchronous once a broker
 import logging
 
 from celery import shared_task
+from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(ignore_result=True)
-def dispatch_push(recipient_id, title, body, extra_data=None):
+# L7: redelivery dedup for the push tasks. With a real broker, a task can be
+# REDELIVERED to a worker (acks_late + visibility-timeout expiry, or a worker
+# restart mid-task) — and the redelivery carries the SAME Celery task id. We
+# record a task id as "sent" AFTER the send completes and short-circuit any
+# redelivery that finds it already recorded, so a redelivered task doesn't fire
+# a duplicate push. Two important design choices:
+#   • Key on the TASK ID, not the push content. Two genuinely-distinct pushes
+#     (e.g. two real messages from the same sender in the same chat) are
+#     different tasks with different ids, so they're never collapsed.
+#   • Mark AFTER the send, not before. A crash mid-send leaves the key unset, so
+#     the redelivery still does the work — at-least-once, never a dropped push.
+#     The only residual duplicate window is a crash landing between send-return
+#     and the mark, which is vanishing.
+# Entirely inert in EAGER mode (current default, no broker): there is no
+# redelivery, and each .delay() apply gets a fresh task id anyway.
+_PUSH_DEDUP_TTL_S = 600
+
+
+def _push_already_sent(task_id) -> bool:
+    return bool(task_id) and cache.get(f"push_task_sent:{task_id}") is not None
+
+
+def _mark_push_sent(task_id) -> None:
+    if task_id:
+        cache.add(f"push_task_sent:{task_id}", 1, timeout=_PUSH_DEDUP_TTL_S)
+
+
+@shared_task(bind=True, ignore_result=True)
+def dispatch_push(self, recipient_id, title, body, extra_data=None):
     """Send one user's push notification from a worker (SY-2).
 
     This is what push_to_user enqueues: re-fetch the recipient by id (tasks take
@@ -84,6 +112,9 @@ def dispatch_push(recipient_id, title, body, extra_data=None):
     recurse — under a real broker it would spawn tasks forever, and in eager
     mode it would blow the stack. Always invoke the sync worker from here.
     """
+    if _push_already_sent(self.request.id):
+        return  # L7: redelivery of an already-sent push — skip the duplicate.
+
     from django.contrib.auth.models import User
 
     from .services.push import _send_push_to_user
@@ -93,10 +124,11 @@ def dispatch_push(recipient_id, title, body, extra_data=None):
     except User.DoesNotExist:
         return
     _send_push_to_user(recipient, title=title, body=body, extra_data=extra_data)
+    _mark_push_sent(self.request.id)
 
 
-@shared_task(ignore_result=True)
-def dispatch_push_to_many(recipient_ids, title, body, extra_data=None):
+@shared_task(bind=True, ignore_result=True)
+def dispatch_push_to_many(self, recipient_ids, title, body, extra_data=None):
     """Fan a push out to many recipients from a worker (WS-3).
 
     Replaces the consumer receive loop's N sequential FCM round trips with a
@@ -111,6 +143,9 @@ def dispatch_push_to_many(recipient_ids, title, body, extra_data=None):
         devices go out in one multicast, so it's one FCM call per recipient, not
         per device.
     """
+    if _push_already_sent(self.request.id):
+        return  # L7: redelivery of an already-sent fan-out — skip duplicates.
+
     from collections import defaultdict
 
     from django.contrib.auth.models import User
@@ -151,3 +186,27 @@ def dispatch_push_to_many(recipient_ids, title, body, extra_data=None):
             send_push_notification(tokens=tokens, title=title, body=body, data=data)
         except Exception as exc:  # pragma: no cover - best effort
             logger.warning("[dispatch_push_to_many] send to %s failed: %s", uid, exc)
+
+    _mark_push_sent(self.request.id)  # L7: mark after the fan-out completes.
+
+
+@shared_task(ignore_result=True)
+def notify_moderation(
+    kind, report_id, target_id, target_label, reason, reporter_username,
+    details="",
+):
+    """Escalate a freshly-filed user report to the moderation channel (H4).
+
+    Off the request path, like the push tasks: the report row is already
+    committed and visible in admin before this runs. Delegates to
+    ``services.moderation.escalate_report``, which coalesces floods and swallows
+    its own SES/Slack errors — so a flaky alert channel can never affect the
+    report write or retry-storm the worker.
+    """
+    from .services.moderation import escalate_report
+
+    escalate_report(
+        kind=kind, report_id=report_id, target_id=target_id,
+        target_label=target_label, reason=reason,
+        reporter_username=reporter_username, details=details,
+    )

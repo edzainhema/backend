@@ -57,6 +57,7 @@ def serialize_post(
                 "name": post.page.name,
                 "avatar": page_avatar,
                 "is_private": post.page.is_private,
+                "is_super_private": post.page.is_super_private,
             }
             if post.page else None
         ),
