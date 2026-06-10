@@ -52,6 +52,7 @@ from .follow import (
     reject_follow_request,
     list_my_followers,
     remove_my_follower,
+    match_contacts,
 )
 from .memories import (
     toggle_page_memory,
@@ -97,6 +98,7 @@ from .pages import (
     get_page_detail,
     toggle_page_follow,
     list_pages,
+    list_my_pages,
     update_page_avatar,
     list_sent_page_invites,
     search_users_for_page_invite,

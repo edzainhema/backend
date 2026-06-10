@@ -227,11 +227,22 @@ def explore_feed(request):
                 {
                     "id": m.id,
                     "file": request.build_absolute_uri(m.file.url),
+                    "hls": (
+                        request.build_absolute_uri(m.hls_master.url)
+                        if m.hls_master else None
+                    ),
                     "thumbnail": (
                         request.build_absolute_uri(m.thumbnail.url)
                         if m.thumbnail else None
                     ),
                     "order": m.order,
+                    # Upload-time dimensions + placeholder colour, same as the
+                    # personalised feed (serialize_post) sends — so the client
+                    # can size the explore tile before the image loads instead
+                    # of rendering it square and resizing on screen.
+                    "width": m.width,
+                    "height": m.height,
+                    "placeholder_color": m.placeholder_color,
                     "tags": [
                         {"id": t.user.id, "username": t.user.username}
                         for t in m.tags.all()
@@ -241,6 +252,13 @@ def explore_feed(request):
             ],
 
             "video": request.build_absolute_uri(first.file.url),
+            # Adaptive-bitrate HLS master playlist for the first media; null
+            # when absent. The app prefers this over `video`, falling back to
+            # the MP4 when null.
+            "hls": (
+                request.build_absolute_uri(first.hls_master.url)
+                if first.hls_master else None
+            ),
 
             "user": {
                 "id": post.user.id,

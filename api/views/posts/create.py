@@ -6,7 +6,7 @@ import mimetypes
 import re
 
 
-from PIL import Image
+from PIL import Image, ImageOps
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.db import models, transaction
@@ -17,7 +17,8 @@ from rest_framework.response import Response
 
 from ...models import BlockedUser, Follow, Notification, Page, PagePoster, Post, PostMedia, PostMediaTag
 from ...serializers import ProfilePostSerializer
-from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, process_media_image, process_media_video, validate_uploaded_media_file, verify_uploaded_media
+from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, average_color, make_image_thumbnail, process_media_image, process_media_video, validate_uploaded_media_file, verify_uploaded_media
+from ...tasks import process_post_media
 from ...services.push import push_to_user
 from ...services.hashtags import sync_post_hashtags
 from ...services.throttles import PostCreateRateThrottle
@@ -44,6 +45,13 @@ def _image_dimensions(file_like):
     try:
         file_like.seek(0)
         with Image.open(file_like) as img:
+            # Report EXIF-corrected dimensions so the stored width/height match
+            # how the image displays. A phone portrait photo is often stored as
+            # landscape pixels + an EXIF rotate tag; the feed sizes its tile from
+            # these numbers and shows the EXIF-rotated image, so raw (un-rotated)
+            # dimensions would give a wrong-shaped box and cover would crop the
+            # photo. exif_transpose is a no-op for images with no orientation tag.
+            img = ImageOps.exif_transpose(img)
             return img.size
     except Exception:
         # Video or unreadable image — dimensions stay null. The frontend's
@@ -165,9 +173,44 @@ def _process_media_files(request, files):
         # (best-effort; videos and unreadable images come back (None, None)).
         width, height = _image_dimensions(processed_file)
 
+        # PIL can't measure a video, so for videos derive the DISPLAY dimensions
+        # from the thumbnail — the first frame at native resolution, so it
+        # carries the same aspect ratio. Without this the feed has no aspect for
+        # a video post: it renders the tile square (cropping the video) and only
+        # resizes once the player reports its natural size on load — the visible
+        # "shows squished, then resizes, then plays" jump on a feed video.
+        # _image_dimensions reseeks to 0, so the thumbnail is still saveable below.
+        if is_video and (width is None or height is None):
+            vid_thumb = baked_thumbnail or request.FILES.get(f'thumbnail_{idx}')
+            if vid_thumb is not None:
+                width, height = _image_dimensions(vid_thumb)
+
+        # NOTE: HLS packaging for videos is NOT done here anymore. It's the slow
+        # part of the pipeline, so it's deferred to the process_post_media
+        # Celery task (enqueued via on_commit after the post is created). The
+        # MP4 produced above is immediately playable; hls_master backfills when
+        # the task runs. See create_post below.
+
+        # Bake a small JPEG thumbnail for EVERY image (edited or not) so the
+        # media grid decodes a sub-1MB bitmap per cell instead of the full-res
+        # file — this is what kills the grey-tile flip from bitmap-cache
+        # eviction on scroll. Best-effort: a None just leaves `thumbnail` null
+        # and the grid falls back to `file` (legacy behaviour). Generated here,
+        # outside the DB transaction, alongside the rest of the slow media work.
+        # make_image_thumbnail reseeks processed_file to 0 on the way out, so it
+        # is still safe to save as PostMedia.file below.
+        image_thumbnail = make_image_thumbnail(processed_file) if is_image else None
+
+        # Average colour, used as the tile background so the photo fades in over
+        # a matched colour instead of a hard grey box. Seek-safe like the calls
+        # above. Images only; videos/None leave it null.
+        placeholder_color = average_color(processed_file) if is_image else None
+
         results.append({
             "processed_file": processed_file,
             "is_video": is_video,
+            "image_thumbnail": image_thumbnail,
+            "placeholder_color": placeholder_color,
             "baked_thumbnail": baked_thumbnail,
             # Client-extracted raw first frame, used as the thumbnail when the
             # server didn't bake one (unedited video, or extraction failed).
@@ -480,6 +523,7 @@ def create_post(request):
                     order=idx,
                     width=item["width"],
                     height=item["height"],
+                    placeholder_color=item["placeholder_color"],
                 )
                 # Record the storage path so the rollback handler can clean
                 # it up if a later step in the loop fails. pm.file.name is
@@ -487,6 +531,19 @@ def create_post(request):
                 # which is the form default_storage.delete() expects.
                 if pm.file and pm.file.name:
                     written_file_paths.append(pm.file.name)
+
+                # Package this video into an adaptive-bitrate HLS ladder on a
+                # worker (SY-1). Enqueued via transaction.on_commit so it only
+                # runs AFTER this transaction commits — the row exists, and a
+                # rolled-back post never enqueues. The MP4 saved above is already
+                # playable; hls_master backfills when the task finishes (the app
+                # prefers hls and falls back to the MP4 until then). In EAGER
+                # mode (no broker) .delay runs inline at commit. `mid=pm.id`
+                # binds the current row id (not the loop variable).
+                if item["is_video"]:
+                    transaction.on_commit(
+                        lambda mid=pm.id: process_post_media.delay(mid)
+                    )
 
                 # Save the video's thumbnail.
                 #
@@ -503,13 +560,20 @@ def create_post(request):
                 # Django's FileSystemStorage and most cloud backends already
                 # sanitize this further, but server-controlled names give us a
                 # clean belt-and-braces guarantee.
+                # For images, `image_thumbnail` is the server-downscaled small
+                # JPEG baked above (None on a best-effort failure). Same column,
+                # same server-derived filename, same rollback-cleanup tracking
+                # as the video path — only the source of the thumbnail differs
+                # (a shrunk copy of the photo vs the clip's first frame).
                 if item["is_video"]:
                     thumbnail = item["baked_thumbnail"] or item["client_thumbnail"]
-                    if thumbnail:
-                        safe_name = f'post_{post.id}_media_{idx}_thumb.jpg'
-                        pm.thumbnail.save(safe_name, thumbnail, save=True)
-                        if pm.thumbnail and pm.thumbnail.name:
-                            written_file_paths.append(pm.thumbnail.name)
+                else:
+                    thumbnail = item.get("image_thumbnail")
+                if thumbnail:
+                    safe_name = f'post_{post.id}_media_{idx}_thumb.jpg'
+                    pm.thumbnail.save(safe_name, thumbnail, save=True)
+                    if pm.thumbnail and pm.thumbnail.name:
+                        written_file_paths.append(pm.thumbnail.name)
 
                 # Persist who the uploader tagged in this specific media item.
                 # We resolve the requested IDs to actual User rows here (one

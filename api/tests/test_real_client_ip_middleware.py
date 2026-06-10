@@ -39,23 +39,27 @@ class RealClientIPMiddlewareTests(SimpleTestCase):
         )
         self.assertEqual(addr, "198.51.100.42")
 
-    def test_xff_multi_hop_takes_first_entry(self):
-        # Client -> CDN -> LB -> nginx -> us. XFF accumulates
-        # left-to-right; the leftmost entry is the original client.
+    def test_xff_multi_hop_takes_last_entry(self):
+        # Client -> CDN -> LB -> nginx -> us. The leftmost entries are
+        # attacker-controllable (a client can pre-seed X-Forwarded-For), so
+        # per the H-1 trust model we take the RIGHTMOST entry — the address
+        # our single trusted proxy (nginx) appended, which is the real peer
+        # that connected to it. (See RealClientIPMiddleware docstring.)
         addr = self._process(
             HTTP_X_FORWARDED_FOR="198.51.100.42, 203.0.113.7, 10.0.0.2",
             REMOTE_ADDR="10.0.0.1",
         )
-        self.assertEqual(addr, "198.51.100.42")
+        self.assertEqual(addr, "10.0.0.2")
 
     def test_xff_with_whitespace_is_trimmed(self):
         # Some proxies (and some Postman setups) emit `entry, entry`
-        # with a leading space after the comma. Make sure we strip.
+        # with a leading space after the comma. Make sure the chosen
+        # (rightmost) entry is stripped of surrounding whitespace.
         addr = self._process(
-            HTTP_X_FORWARDED_FOR=" 198.51.100.42 , 10.0.0.2",
+            HTTP_X_FORWARDED_FOR=" 198.51.100.42 , 10.0.0.2 ",
             REMOTE_ADDR="10.0.0.1",
         )
-        self.assertEqual(addr, "198.51.100.42")
+        self.assertEqual(addr, "10.0.0.2")
 
     def test_no_xff_leaves_remote_addr_unchanged(self):
         # Local dev / direct connection (no proxy). The middleware

@@ -1,0 +1,21 @@
+# Timer for backfill-hls.service — periodically re-encodes any video post left
+# without an HLS stream (failed/lost background encode). See backfill-hls.service
+# for install instructions.
+#
+# Runs every 15 minutes so a failed encode heals quickly without hammering the
+# worker. Each run is bounded by the command's --limit, so a large backlog
+# drains over several ticks rather than all at once. Adjust the cadence to taste.
+
+[Unit]
+Description=Periodic schedule for the HLS self-heal backfill
+
+[Timer]
+# Every 15 minutes, starting 5 min after boot.
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+# Spread the start so a fleet of hosts doesn't all fire at once.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

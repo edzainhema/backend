@@ -165,6 +165,13 @@ def reels_feed(request):
             "is_public_override": post.is_public_override,
 
             "video": request.build_absolute_uri(media.file.url),
+            # Adaptive-bitrate HLS master playlist; null when the clip predates
+            # HLS packaging or generation failed. The app prefers this over
+            # `video` and falls back to the MP4 when null.
+            "hls": (
+                request.build_absolute_uri(media.hls_master.url)
+                if media.hls_master else None
+            ),
 
             "user": {
                 "id": post.user.id,

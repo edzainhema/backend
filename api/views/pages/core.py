@@ -227,6 +227,14 @@ def get_page_detail(request):
                     {
                         "id": m.id,
                         "file": request.build_absolute_uri(m.file.url),
+                        # Adaptive-bitrate HLS master playlist; null when absent.
+                        # The PageFeed (and home feed) prefer this over `file` so
+                        # long clips start fast (HLS fetches only the first
+                        # segment vs buffering a big MP4). Falls back to `file`.
+                        "hls": (
+                            request.build_absolute_uri(m.hls_master.url)
+                            if m.hls_master else None
+                        ),
                         "thumbnail": (
                             request.build_absolute_uri(m.thumbnail.url)
                             if m.thumbnail else None
@@ -446,6 +454,58 @@ def list_pages(request):
     ]
 
     return Response(data)
+
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_my_pages(request):
+    """Pages the signed-in user created (owner == viewer), newest first.
+
+    Backs the Profile → "My pages" screen. Supports an optional `search`
+    (case-insensitive name match) plus offset/limit pagination, mirroring the
+    rest of the codebase. Fetches one extra row to compute `has_more` without a
+    COUNT. Avatars come back as absolute URLs so the client can render them
+    directly.
+    """
+    viewer = request.user
+
+    search = (request.query_params.get("search") or "").strip()
+
+    try:
+        limit = int(request.query_params.get("limit", 30))
+    except (TypeError, ValueError):
+        limit = 30
+    try:
+        offset = int(request.query_params.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    limit = max(1, min(limit, 60))
+    offset = max(0, offset)
+
+    qs = Page.objects.filter(owner=viewer)
+    if search:
+        qs = qs.filter(name__icontains=search)
+    qs = qs.order_by("-created_at", "-id")
+
+    # One extra row to detect more without a separate COUNT.
+    window = list(qs[offset:offset + limit + 1])
+    has_more = len(window) > limit
+    window = window[:limit]
+
+    results = [
+        {
+            "id": page.id,
+            "name": page.name,
+            "avatar": request.build_absolute_uri(page.avatar.url) if page.avatar else None,
+            "is_private": page.is_private,
+            "is_super_private": page.is_super_private,
+            "created_at": page.created_at.isoformat(),
+        }
+        for page in window
+    ]
+
+    return Response({"results": results, "has_more": has_more})
 
 
 

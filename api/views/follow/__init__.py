@@ -12,6 +12,9 @@ from .followers import (
     list_my_followers,
     remove_my_follower,
 )
+from .contacts import (
+    match_contacts,
+)
 
 __all__ = [
     "toggle_follow",
@@ -19,4 +22,5 @@ __all__ = [
     "reject_follow_request",
     "list_my_followers",
     "remove_my_follower",
+    "match_contacts",
 ]

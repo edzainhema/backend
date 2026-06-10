@@ -92,6 +92,13 @@ def serialize_post(
             {
                 "id": m.id,
                 "file": request.build_absolute_uri(m.file.url),
+                # Adaptive-bitrate HLS master playlist; null when absent. The
+                # home feed prefers this over `file` so long clips start fast
+                # (HLS fetches only the first segment vs buffering a big MP4).
+                "hls": (
+                    request.build_absolute_uri(m.hls_master.url)
+                    if m.hls_master else None
+                ),
                 "thumbnail": (
                     request.build_absolute_uri(m.thumbnail.url)
                     if m.thumbnail else None
@@ -102,6 +109,9 @@ def serialize_post(
                 # falls back to Image.getSize / video naturalSize then.
                 "width": m.width,
                 "height": m.height,
+                # Average colour ("#rrggbb") shown as the tile background while
+                # the photo fades in. Null for videos and legacy rows.
+                "placeholder_color": m.placeholder_color,
                 "tags": [
                     {
                         "id": t.user.id,

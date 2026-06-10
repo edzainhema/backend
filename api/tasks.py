@@ -6,8 +6,7 @@ doing slow work inline:
 
   * dispatch_push / dispatch_push_to_many — push notifications off the request
     thread (SY-2) and off the WebSocket receive loop (WS-3).
-  * process_post_media (SY-1) will be added here when media transcoding is
-    moved out of create_post.
+  * process_post_media (SY-1) — HLS packaging off the upload request path.
 
 Task arguments are JSON-serialisable primitives (ids, strings, dicts) — we pass
 a user *id*, never a model instance, and re-fetch inside the task. With no
@@ -32,21 +31,12 @@ are safe to call everywhere today; they become truly asynchronous once a broker
 #   * WS-3 — DONE. api/consumers.py fans per-message push out via
 #            dispatch_push_to_many(...) (see _enqueue_push_fanout there), so
 #            the FCM round trips leave the WebSocket receive loop.
-#   * SY-1 — PARTIALLY DONE. The FFmpeg / Pillow transcode no longer runs
-#            inside create_post's DB transaction: api/views/posts/create.py
-#            now processes all media in _process_media_files(...) BEFORE the
-#            atomic() block, which then only does fast row writes. That alone
-#            removes the critical "connection + SQLite write lock held open
-#            for the whole transcode" problem.
-#            STILL OPEN (optional, needs the broker live): to also free the
-#            *request worker* during the transcode, add a process_post_media(
-#            post_id) task here, stage the raw upload + editor metadata in a
-#            short transaction with the Post in a "processing" state, return
-#            202 immediately, and have the task transcode, attach the
-#            thumbnail/dimensions, fire the mention notifications + feed-cache
-#            invalidation, then flip the post to "ready". That last step also
-#            needs a readiness gate in post_visibility_q (+ the home-feed rule)
-#            and a frontend processing-state contract, so it's a follow-up.
+#   * SY-1 — DONE (HLS). The MP4 + thumbnail are still produced synchronously in
+#            _process_media_files (fast, keeps the post immediately playable),
+#            but the slow HLS ladder is now packaged by process_post_media(...)
+#            below, enqueued via transaction.on_commit after the post commits.
+#            Because the MP4 is always present, no "processing" post state or
+#            feed readiness gate is needed — hls_master simply backfills.
 #   * SY-2 — DONE. push_to_user (api/utils.py) is now an enqueue wrapper that
 #            calls dispatch_push.delay(...); the Device query + blocking FCM
 #            send live in _send_push_to_user, which this task invokes on a
@@ -63,11 +53,22 @@ are safe to call everywhere today; they become truly asynchronous once a broker
 # See BACKEND_SCALING_AUDIT.md for the full write-ups.
 # ---------------------------------------------------------------------------
 import logging
+import os
 
 from celery import shared_task
 from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+
+# Per-task time limits for media encoding (process_post_media). The HLS ladder
+# for a long (~7-min) clip can run for several minutes — far longer than the
+# quick push/notify tasks — so it gets its OWN, generous limits here instead of
+# raising the global CELERY_TASK_*_TIME_LIMIT (which would let a stuck quick
+# task hang for minutes too). Keep these ABOVE hls.HLS_ENCODE_TIMEOUT so
+# ffmpeg's own timeout trips first with a clean log line; the Celery hard limit
+# is only the backstop for a process that ignores SIGTERM. Tunable via env.
+_MEDIA_SOFT_TIME_LIMIT = int(os.environ.get("MEDIA_TASK_SOFT_TIME_LIMIT", "960"))
+_MEDIA_HARD_TIME_LIMIT = int(os.environ.get("MEDIA_TASK_TIME_LIMIT", "1020"))
 
 
 # L7: redelivery dedup for the push tasks. With a real broker, a task can be
@@ -188,6 +189,69 @@ def dispatch_push_to_many(self, recipient_ids, title, body, extra_data=None):
             logger.warning("[dispatch_push_to_many] send to %s failed: %s", uid, exc)
 
     _mark_push_sent(self.request.id)  # L7: mark after the fan-out completes.
+
+
+@shared_task(
+    ignore_result=True,
+    soft_time_limit=_MEDIA_SOFT_TIME_LIMIT,
+    time_limit=_MEDIA_HARD_TIME_LIMIT,
+)
+def process_post_media(post_media_id):
+    """Package one video PostMedia into an HLS ladder on a worker (SY-1).
+
+    The MP4 (`pm.file`) and its thumbnail were already produced synchronously in
+    create_post, so the post is playable the moment it's created. This task does
+    only the slow, optional HLS step off the request path: read the stored MP4,
+    build the adaptive ladder, upload it, and point `hls_master` at the master
+    playlist. The app prefers `hls` and falls back to the MP4, so until this
+    runs (or if it fails) the clip simply plays the MP4 — HLS is best-effort.
+
+    Enqueued via `transaction.on_commit(process_post_media.delay, pm.id)` so it
+    never runs before the row is committed or for a rolled-back post. In EAGER
+    mode (no broker) it runs inline at commit, matching the old behaviour.
+
+    Idempotent: returns early if `hls_master` is already set, so a redelivery
+    (acks_late) or a manual re-run never double-encodes or orphans a second
+    bundle. Every failure path leaves `hls_master` null and logs — the MP4
+    keeps playing, so a flaky encode never affects the post.
+    """
+    from django.core.files.storage import default_storage
+
+    from .models import PostMedia
+    from .services.media import build_hls_ladder, store_hls_bundle
+
+    try:
+        pm = PostMedia.objects.get(id=post_media_id)
+    except PostMedia.DoesNotExist:
+        return  # media deleted between enqueue and run — nothing to do
+
+    # Already packaged (redelivery / re-run) — don't encode or store again.
+    if pm.hls_master:
+        return
+
+    # Pull the stored MP4 bytes (it's in S3/local storage by now).
+    try:
+        with default_storage.open(pm.file.name, "rb") as fh:
+            video_bytes = fh.read()
+    except Exception as exc:
+        logger.warning("[process_post_media] %s: cannot read source: %s", post_media_id, exc)
+        return
+
+    bundle = build_hls_ladder(video_bytes)
+    if bundle is None:
+        # Encode failed (logged inside build_hls_ladder). Leave the MP4 as the
+        # only source; it's already playable. Re-runnable later if needed.
+        logger.error("[process_post_media] %s: HLS encode failed, keeping MP4", post_media_id)
+        return
+
+    try:
+        master_key, _keys = store_hls_bundle(bundle)
+    except Exception as exc:
+        logger.error("[process_post_media] %s: HLS store failed, keeping MP4: %s", post_media_id, exc)
+        return
+
+    pm.hls_master.name = master_key
+    pm.save(update_fields=["hls_master"])
 
 
 @shared_task(ignore_result=True)

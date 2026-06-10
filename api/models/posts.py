@@ -104,6 +104,13 @@ class PostMedia(models.Model):
     post = models.ForeignKey('Post', on_delete=models.CASCADE, related_name="media", db_index=True)
     file = models.FileField(upload_to="uploads/")
     thumbnail = models.ImageField(upload_to="thumbnails/", null=True, blank=True)
+    # Master HLS playlist for video media. When set, the app prefers this
+    # adaptive-bitrate stream over `file` (the plain MP4, which stays as a
+    # fallback). Null for images and for videos uploaded before HLS packaging
+    # existed (or when best-effort HLS generation failed) — the app falls back
+    # to `file` in those cases. The variant playlists + segments live in
+    # storage alongside this master and are referenced by relative path.
+    hls_master = models.FileField(upload_to="hls/", null=True, blank=True)
     order = models.PositiveIntegerField(default=0)
     # Pixel dimensions of the underlying media. Captured at upload time so
     # the feed can size each tile before the asset finishes loading,
@@ -113,9 +120,17 @@ class PostMedia(models.Model):
     # NULL and the frontend falls back to the runtime sizing path.
     width = models.PositiveIntegerField(null=True, blank=True)
     height = models.PositiveIntegerField(null=True, blank=True)
+    # Average colour of the image as a hex string ("#rrggbb"), painted as the
+    # tile background so the photo fades in over a matched colour instead of a
+    # hard grey box while loading. Null for videos and legacy rows.
+    placeholder_color = models.CharField(max_length=7, null=True, blank=True)
 
     def __str__(self):
-        return f"Media {self.id} for Post {self.post_id}"
+        page_name = self.post.page.name if self.post.page_id else "(no page)"
+        return (
+            f"Media {self.id} for Post {self.post_id} "
+            f"in Page {page_name} by {self.post.user.username}"
+        )
 
 class PostMediaTag(models.Model):
     media = models.ForeignKey("PostMedia", on_delete=models.CASCADE, related_name="tags")

@@ -2,7 +2,7 @@
 from io import BytesIO
 
 from django.core.files.base import ContentFile
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
 from .fonts import resolve_overlay_font_path
 from .overlays import _safe_float, _safe_int, _draw_text_overlay
@@ -52,7 +52,7 @@ def process_media_image(input_file, metadata):
     if 'brightness' in enhancements:
         img = ImageEnhance.Brightness(img).enhance(enhancements['brightness'])
 
-    # ── Uniform contain-scale + centred offsets ──────────────────────
+    # Uniform contain-scale + centred offsets.
     # The mobile preview displays the image with object-fit: contain inside
     # the preview box, so overlay coordinates need the same transform when
     # mapped onto the underlying image pixels. Independent x/y scaling would
@@ -118,3 +118,90 @@ def process_media_image(input_file, metadata):
     return ContentFile(buffer.getvalue(), name=input_file.name)
 
 
+# Long edge (px) of the grid/feed thumbnail baked for image posts. The media
+# grid renders 3 columns of ~130px-wide cells on the largest phones, so a
+# 400px-long-edge JPEG is comfortably above 2x for those tiles while decoding
+# to a sub-1MB bitmap (vs the ~48MB a full-res 12MP photo decodes to). Keeping
+# the decoded footprint tiny is what stops the bitmap cache from evicting grid
+# tiles on scroll-back and flashing the grey placeholder.
+IMAGE_THUMBNAIL_MAX_EDGE = 400
+IMAGE_THUMBNAIL_QUALITY = 80
+
+
+def make_image_thumbnail(
+    input_file,
+    max_edge=IMAGE_THUMBNAIL_MAX_EDGE,
+    quality=IMAGE_THUMBNAIL_QUALITY,
+):
+    """Downscale an image to a small JPEG thumbnail for the media grid.
+
+    Returns a ``ContentFile`` (JPEG bytes) on success, or ``None`` on any
+    failure — exactly like the video first-frame path, thumbnail generation is
+    best-effort and must never break an otherwise-valid upload (the grid falls
+    back to the full-res ``file`` when ``thumbnail`` is null).
+
+    The read cursor of ``input_file`` is reset to 0 both before reading and in a
+    ``finally`` on the way out, so the SAME object can still be handed straight
+    to ``PostMedia.file`` for storage afterwards — mirroring the seek discipline
+    in ``_image_dimensions`` (create.py). Never upscales: ``Image.thumbnail``
+    only shrinks, so small source images are stored as-is.
+    """
+    try:
+        input_file.seek(0)
+        with Image.open(input_file) as img:
+            # Bake EXIF orientation into the pixels. Phone cameras often store
+            # the raw sensor pixels plus an "Orientation" tag telling the viewer
+            # to rotate 90/180/270°. The client honours that tag on the original
+            # file, but a re-encoded thumbnail drops it — so without this the
+            # grid thumbnail renders sideways/upside-down while the full image
+            # looks correct. exif_transpose rotates the pixels and removes the
+            # now-redundant tag; it is a no-op for images with no orientation.
+            img = ImageOps.exif_transpose(img)
+            # Flatten to RGB (JPEG has no alpha); compositing onto white keeps
+            # transparent PNGs from going black. ``thumbnail`` preserves aspect
+            # ratio and only ever reduces, so portrait/landscape both work and
+            # an already-small image is left untouched.
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGBA')
+                background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+                img = Image.alpha_composite(background, img).convert('RGB')
+            else:
+                img = img.convert('RGB')
+
+            img.thumbnail((max_edge, max_edge), Image.LANCZOS)
+
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            buffer.seek(0)
+            return ContentFile(buffer.getvalue())
+    except Exception:
+        return None
+    finally:
+        try:
+            input_file.seek(0)
+        except Exception:
+            pass
+
+
+def average_color(input_file):
+    """Return the image's average colour as a hex string ("#rrggbb"), or None.
+
+    Painted as the tile background so a photo fades in over a matched colour
+    instead of a hard grey box while loading. Computed by collapsing the image
+    to a single pixel (PIL averages during the resize) — fast and plenty for a
+    placeholder. Best-effort and seek-safe like make_image_thumbnail, so the
+    SAME file object can still be stored afterwards.
+    """
+    try:
+        input_file.seek(0)
+        with Image.open(input_file) as img:
+            img = ImageOps.exif_transpose(img).convert('RGB').resize((1, 1))
+            r, g, b = img.getpixel((0, 0))
+            return f'#{r:02x}{g:02x}{b:02x}'
+    except Exception:
+        return None
+    finally:
+        try:
+            input_file.seek(0)
+        except Exception:
+            pass

@@ -27,6 +27,7 @@ class MediaSerializer(serializers.ModelSerializer):
 class PostMediaSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     file = serializers.SerializerMethodField()
+    hls = serializers.SerializerMethodField()
     thumbnail = serializers.SerializerMethodField()
     order = serializers.IntegerField()
     tags = serializers.SerializerMethodField()
@@ -35,6 +36,7 @@ class PostMediaSerializer(serializers.Serializer):
     # columns serialize as null — the client falls back to runtime sizing.
     width = serializers.IntegerField(allow_null=True)
     height = serializers.IntegerField(allow_null=True)
+    placeholder_color = serializers.CharField(allow_null=True)
 
     def get_file(self, obj):
         request = self.context.get('request')
@@ -46,6 +48,14 @@ class PostMediaSerializer(serializers.Serializer):
             return request.build_absolute_uri(obj.thumbnail.url) if request else obj.thumbnail.url
         return None
 
+    def get_hls(self, obj):
+        # Master HLS playlist URL when the clip has one; null otherwise (the
+        # client falls back to `file`). Guarded so image/legacy rows are null.
+        if not getattr(obj, 'hls_master', None):
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.hls_master.url) if request else obj.hls_master.url
+
     def get_tags(self, obj):
         return [
             {'id': t.user.id, 'username': t.user.username}
@@ -55,15 +65,25 @@ class PostMediaSerializer(serializers.Serializer):
 class ProfilePostMediaSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     file = serializers.SerializerMethodField()
+    hls = serializers.SerializerMethodField()
     thumbnail = serializers.SerializerMethodField()
     order = serializers.IntegerField()
     # See PostMediaSerializer for rationale on the nullable width/height.
     width = serializers.IntegerField(allow_null=True)
     height = serializers.IntegerField(allow_null=True)
+    placeholder_color = serializers.CharField(allow_null=True)
 
     def get_file(self, obj):
         request = self.context.get('request')
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
+
+    def get_hls(self, obj):
+        # Master HLS playlist URL when present; null otherwise (client falls
+        # back to `file`). Guarded so image/legacy rows are null.
+        if not getattr(obj, 'hls_master', None):
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.hls_master.url) if request else obj.hls_master.url
 
     def get_thumbnail(self, obj):
         request = self.context.get('request')

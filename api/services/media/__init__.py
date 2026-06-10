@@ -17,8 +17,15 @@ from .validation import (
 from .fonts import _first_existing, resolve_overlay_font_path
 from .filters import VIDEO_FILTER_CHAINS
 from .overlays import _safe_float, _safe_int, _safe_optional_float
-from .images import process_media_image
+from .images import (
+    process_media_image,
+    make_image_thumbnail,
+    average_color,
+    IMAGE_THUMBNAIL_MAX_EDGE,
+    IMAGE_THUMBNAIL_QUALITY,
+)
 from .video import process_media_video
+from .hls import build_hls_ladder, store_hls_bundle
 
 __all__ = [
     "IMAGE_MAX_BYTES",
@@ -38,5 +45,11 @@ __all__ = [
     "_safe_int",
     "_safe_optional_float",
     "process_media_image",
+    "make_image_thumbnail",
+    "average_color",
+    "IMAGE_THUMBNAIL_MAX_EDGE",
+    "IMAGE_THUMBNAIL_QUALITY",
     "process_media_video",
+    "build_hls_ladder",
+    "store_hls_bundle",
 ]

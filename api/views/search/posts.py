@@ -138,6 +138,10 @@ def search_posts(request):
                 for m in media_qs
             ],
             "video": request.build_absolute_uri(first.file.url),
+            "hls": (
+                request.build_absolute_uri(first.hls_master.url)
+                if first.hls_master else None
+            ),
             "user": {
                 "id": post.user.id,
                 "username": post.user.username,

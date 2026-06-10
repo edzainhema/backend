@@ -1,0 +1,30 @@
+# systemd unit for the HLS self-heal backfill (re-encodes video posts whose
+# background HLS task failed or was lost). Pairs with backfill-hls.timer.
+#
+# Install:
+#   1. Edit WorkingDirectory / ExecStart / User below for your deployment.
+#   2. Copy both unit files into /etc/systemd/system/:
+#        sudo cp backend/deploy/systemd/backfill-hls.{service,timer} /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now backfill-hls.timer
+#
+# Check it:  systemctl list-timers backfill-hls.timer
+# Logs:      journalctl -u backfill-hls.service   (and backend/logs/backfill_hls.log)
+#
+# Note: by default this ENQUEUES encodes to the Celery worker, so the worker +
+# broker (REDIS_URL) must be running. To encode inline instead, add
+# Environment=BACKFILL_HLS_ARGS=--sync below.
+
+[Unit]
+Description=HLS self-heal backfill (re-encode video posts missing hls_master)
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=here-social
+Group=here-social
+WorkingDirectory=/srv/here-social/backend
+# Same Redis the worker uses, so enqueued encodes reach it.
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+ExecStart=/usr/bin/bash /srv/here-social/backend/scripts/run_backfill_hls.sh
