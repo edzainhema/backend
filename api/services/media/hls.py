@@ -30,15 +30,20 @@ logger = logging.getLogger(__name__)
 #
 # Two-rung 360/720 ladder (dropped the previous 540p middle rung) — on phone-
 # first social video the player smoothly adapts between 360 and 720 without
-# needing the intermediate tier, and removing one rung cuts encode time and
-# storage by ~33%. Cost: viewers on the narrow bandwidth band that could have
-# used 540p (poor 3G / congested wifi) get locked at 360p one notch lower than
-# they otherwise would — affects a small minority of sessions. If we ever see
-# real-world complaints about quality on those networks, add the 540p entry
-# back here and that's the only change needed.
+# needing the intermediate tier. Cost: viewers on the narrow bandwidth band
+# that could have used 540p (poor 3G / congested wifi) get locked at 360p one
+# notch lower than they otherwise would — affects a small minority of sessions.
+#
+# 720p rung bitrates were bumped 2000→3500 kbps target / 2200→4000 kbps max
+# to put quality in TikTok-territory range (their 720p sits at ~3-5 Mbps).
+# Larger 720p HLS bundles (~75%) but visibly better on motion-heavy clips,
+# negligible encode time impact, and at pre-launch volume CDN/storage cost
+# is pennies/month. 360p rung intentionally LEFT light: it's the data-saver
+# tier for slow networks, and bumping it would defeat that purpose (viewers
+# who fall back to 360p do so BECAUSE their bandwidth is constrained).
 HLS_LADDER = (
     {"name": "360", "size": 360, "v_kbps": 500,  "maxrate_kbps": 540,  "bufsize_kbps": 750},
-    {"name": "720", "size": 720, "v_kbps": 2000, "maxrate_kbps": 2200, "bufsize_kbps": 3000},
+    {"name": "720", "size": 720, "v_kbps": 3500, "maxrate_kbps": 4000, "bufsize_kbps": 6000},
 )
 AUDIO_KBPS = 128
 SEGMENT_SECONDS = 4
