@@ -3,6 +3,11 @@ and `views.X` (via api.views.__init__) keep resolving unchanged."""
 
 from .core import (
     create_page,
+    delete_page,
+    list_trashed_pages,
+    restore_page,
+    purge_page,
+    restore_my_page_media,
     get_page_detail,
     toggle_page_follow,
     list_pages,
@@ -40,6 +45,11 @@ __all__ = [
     "approve_page_follow_request",
     "reject_page_follow_request",
     "create_page",
+    "delete_page",
+    "list_trashed_pages",
+    "restore_page",
+    "purge_page",
+    "restore_my_page_media",
     "get_page_detail",
     "toggle_page_follow",
     "list_pages",

@@ -49,9 +49,34 @@ class CommentMention(models.Model):
     class Meta:
         unique_together = ("comment", "mentioned_user")
 
+class PostManager(models.Manager):
+    """Default manager that hides trashed posts. A post is hidden when its own
+    ``trashed_at`` is set (it's in the author's trash — deleted directly or
+    cascaded from a deleted page) OR its page is itself trashed (the
+    transitional guard from before the page→post cascade existed). So every
+    ``Post.objects`` surface (home feed, explore, reels, search, profile grids,
+    …) skips trashed content without each query needing its own filter. Use
+    ``Post.all_objects`` for full access (trash bin, restore, purge, cleanup)."""
+
+    def get_queryset(self):
+        return (
+            super()
+            .get_queryset()
+            .filter(trashed_at__isnull=True)
+            .filter(
+                models.Q(page__isnull=True)
+                | models.Q(page__deleted_at__isnull=True)
+            )
+        )
+
+
 class Post(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
-    page = models.ForeignKey('Page', on_delete=models.CASCADE, null=True, blank=True, related_name="posts")
+    # SET_NULL (not CASCADE): a post must be able to OUTLIVE its page so it can
+    # sit in the author's trash after the page is permanently deleted. Every
+    # page-teardown path trashes the page's posts first, so a null page_id only
+    # ever happens to an already-trashed post — never a live page-less one.
+    page = models.ForeignKey('Page', on_delete=models.SET_NULL, null=True, blank=True, related_name="posts")
     description = models.TextField(blank=True)
     # Human-readable location label the poster optionally typed in the
     # upload sheet ("Brooklyn Bridge", "Mom's house", etc.). Distinct
@@ -87,7 +112,21 @@ class Post(models.Model):
     impression_count = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Soft delete ("trash"). Null = live. When set, the post is hidden from the
+    # default manager and lives in its author's trash bin. `trashed_reason`
+    # records how it got there: "self" (the author deleted it) or "page_deleted"
+    # (the post's page was trashed, cascading the trash down to here).
+    trashed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    trashed_reason = models.CharField(max_length=20, blank=True, default="")
+
+    # `objects` hides trashed posts; `all_objects` sees everything.
+    objects = PostManager()
+    all_objects = models.Manager()
+
     class Meta:
+        # Related-object access (e.g. comment.post, like.post) must resolve even
+        # for a trashed-page post, so FK traversal uses the unfiltered manager.
+        base_manager_name = "all_objects"
         indexes = [
             # Feed query: filter by user, order by -created_at
             models.Index(fields=['user', '-created_at', 'id'], name='post_user_created_idx'),

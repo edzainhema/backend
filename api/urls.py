@@ -32,6 +32,7 @@ urlpatterns = [
     # ---------------- Media ----------------
 
     path("posts/create/", views.create_post),
+    path("posts/<int:post_id>/hls-status/", views.post_hls_status),
 
     # ---------------- Follow system ----------------
     path("auth/follow/", views.toggle_follow),
@@ -55,6 +56,11 @@ urlpatterns = [
 
     # ---------------- Pages ----------------
     path("pages/create/", views.create_page),
+    path("pages/delete/", views.delete_page),
+    path("pages/trash/", views.list_trashed_pages),
+    path("pages/restore/", views.restore_page),
+    path("pages/purge/", views.purge_page),
+    path("pages/restore-my-media/", views.restore_my_page_media),
     path("pages/detail/", views.get_page_detail),
     path("pages/follow/", views.toggle_page_follow),
     path("pages/follow/approve/", views.approve_page_follow_request),
@@ -118,6 +124,9 @@ urlpatterns = [
     path("posts/not-interested/", views.not_interested),
     path("posts/saved/", views.saved_posts),
     path("posts/delete/", views.delete_post),
+    path("posts/trash/", views.list_trashed_posts),
+    path("posts/purge/", views.purge_post),
+    path("posts/restore/", views.restore_post),
     path("posts/public-override/", views.toggle_post_public),
 
     # ---------------- Reels ----------------

@@ -64,6 +64,67 @@ MASTER_NAME = "master.m3u8"
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 
 
+# Max portrait aspect for the streamed renditions: 9:16 (width:height). A clip
+# taller than this gets its top+bottom cropped before the ABR split, so the HLS
+# stream matches the 9:16 stored thumbnail/dims and the feed's render-time cap.
+# Kept in sync with images.MAX_PORTRAIT_RATIO (imported lazily to avoid a cycle).
+MAX_PORTRAIT_RATIO = 16 / 9
+
+
+def _displayed_dimensions(path):
+    """Probe ``path`` for the video's DISPLAYED (rotation-corrected, even)
+    dimensions, returning ``(w, h)`` or ``None`` on any failure.
+
+    Mirrors the rotation handling in ``process_media_video``: a phone-portrait
+    clip is often stored as landscape pixels + a rotate/Display-Matrix tag, but
+    every player (and ffmpeg's autorotate, which runs before the filtergraph)
+    shows it rotated — so the crop must be computed against the rotated dims.
+    Even-rounded because libx264 + yuv420p require even dimensions.
+    """
+    try:
+        probe = ffmpeg.probe(path)
+        vstream = next(
+            s for s in probe.get("streams", []) if s.get("codec_type") == "video"
+        )
+        w = int(vstream.get("width") or 0)
+        h = int(vstream.get("height") or 0)
+        rotation = 0
+        try:
+            rotation = int(vstream.get("tags", {}).get("rotate", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        for sd in vstream.get("side_data_list") or []:
+            if sd.get("side_data_type") == "Display Matrix":
+                try:
+                    rotation = int(sd.get("rotation", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        if abs(rotation) % 180 == 90:
+            w, h = h, w
+        if w < 2 or h < 2:
+            return None
+        return w - (w % 2), h - (h % 2)
+    except Exception as e:
+        logger.warning(f"[hls] dimension probe failed; no crop applied: {e}")
+        return None
+
+
+def _crop_filter(w, h, max_ratio=MAX_PORTRAIT_RATIO):
+    """Return a concrete ``crop=W:H:0:Y`` filter that trims a too-tall clip's
+    top+bottom down to ``max_ratio`` (height/width), or ``None`` when the clip
+    is already within the cap (no crop needed). Concrete integers only — no
+    runtime expressions — so it's safe in the argv with no filtergraph escaping.
+    """
+    if not w or not h:
+        return None
+    max_h = int(round(w * max_ratio))
+    max_h -= max_h % 2  # keep even for yuv420p
+    if max_h <= 0 or h <= max_h:
+        return None
+    y = (h - max_h) // 2
+    return f"crop={w}:{max_h}:0:{y}"
+
+
 def _scale_filter(target):
     """Scale filter that caps the LONGER edge at ``target`` px, preserves
     aspect, and keeps BOTH dimensions even (libx264 + yuv420p require even
@@ -75,15 +136,20 @@ def _scale_filter(target):
     )
 
 
-def build_filter_complex(ladder=HLS_LADDER):
-    """Build the ``-filter_complex`` value: split the source into N branches
-    and scale each to its rung. Pure/deterministic — exported for tests.
+def build_filter_complex(ladder=HLS_LADDER, crop=None):
+    """Build the ``-filter_complex`` value: optionally crop the source to the
+    9:16 cap, then split into N branches and scale each to its rung.
+    Pure/deterministic — exported for tests.
 
-    Produces output labels ``[v0out]``, ``[v1out]``, … one per rung.
+    ``crop`` is a concrete ``crop=W:H:x:y`` filter string (from ``_crop_filter``)
+    or ``None``. When present it runs FIRST on ``[0:v]``, before the split, so a
+    single crop feeds every rung. Produces output labels ``[v0out]``, ``[v1out]``,
+    … one per rung.
     """
     n = len(ladder)
     splits = "".join(f"[v{i}]" for i in range(n))
-    parts = [f"[0:v]split={n}{splits}"]
+    pre = f"{crop}," if crop else ""
+    parts = [f"[0:v]{pre}split={n}{splits}"]
     for i, rung in enumerate(ladder):
         parts.append(f"[v{i}]{_scale_filter(rung['size'])}[v{i}out]")
     return ";".join(parts)
@@ -97,14 +163,15 @@ def build_var_stream_map(n, has_audio):
     return " ".join(f"v:{i}" for i in range(n))
 
 
-def build_hls_ffmpeg_args(input_path, out_dir, has_audio, ladder=HLS_LADDER):
+def build_hls_ffmpeg_args(input_path, out_dir, has_audio, ladder=HLS_LADDER, crop=None):
     """Assemble the full ffmpeg argv (after the binary name) for the ladder.
 
     Pure and deterministic given its inputs — exported so the command can be
-    unit-tested without invoking ffmpeg.
+    unit-tested without invoking ffmpeg. ``crop`` (a concrete ``crop=...`` filter
+    string or ``None``) is threaded into the filtergraph to bake the 9:16 cap.
     """
     n = len(ladder)
-    args = ["-y", "-i", input_path, "-filter_complex", build_filter_complex(ladder)]
+    args = ["-y", "-i", input_path, "-filter_complex", build_filter_complex(ladder, crop)]
 
     for i, rung in enumerate(ladder):
         args += [
@@ -174,7 +241,11 @@ def build_hls_ladder(video_bytes, ladder=HLS_LADDER):
 
         tmp_dir = tempfile.mkdtemp(prefix="hls_")
         has_audio = _has_audio_stream(tmp_in)
-        args = [FFMPEG_BIN] + build_hls_ffmpeg_args(tmp_in, tmp_dir, has_audio, ladder)
+        # Bake the 9:16 portrait cap into the renditions when the source is
+        # taller (best-effort: a probe failure → no crop, just like the MP4).
+        dims = _displayed_dimensions(tmp_in)
+        crop = _crop_filter(*dims) if dims else None
+        args = [FFMPEG_BIN] + build_hls_ffmpeg_args(tmp_in, tmp_dir, has_audio, ladder, crop)
 
         proc = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.PIPE

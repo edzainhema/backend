@@ -95,6 +95,11 @@ from .pages import (
     approve_page_follow_request,
     reject_page_follow_request,
     create_page,
+    delete_page,
+    list_trashed_pages,
+    restore_page,
+    purge_page,
+    restore_my_page_media,
     get_page_detail,
     toggle_page_follow,
     list_pages,
@@ -119,11 +124,15 @@ from .pages import (
 )
 from .posts import (
     create_post,
+    post_hls_status,
     toggle_post_like,
     toggle_post_save,
     not_interested,
     saved_posts,
     delete_post,
+    list_trashed_posts,
+    purge_post,
+    restore_post,
     toggle_post_public,
 )
 from .privacy import (

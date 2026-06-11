@@ -27,6 +27,12 @@ class Notification(models.Model):
         ("page_follow_request",   "Page Follow Request"),
         ("page_follow_approved",  "Page Follow Approved"),
         ("page_poster_added",     "Page Poster Added"),
+        # A page the user posted in was deleted (moved to trash by its admin).
+        # Their posts from it have been moved to their own trash bin.
+        ("page_deleted",          "Page Deleted"),
+        # A page the user posted in was restored. Actionable: they can restore
+        # their (page-deletion-trashed) posts back into it, or keep them.
+        ("page_restored",         "Page Restored"),
     )
 
     recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notifications")

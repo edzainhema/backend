@@ -40,6 +40,7 @@ class NotificationSerializer(serializers.Serializer):
     invited_page   = serializers.SerializerMethodField()
     page_follow_request_id = serializers.SerializerMethodField()
     notif_page     = serializers.SerializerMethodField()
+    media_restorable = serializers.SerializerMethodField()
 
     def get_actor(self, obj):
         if not obj.actor:
@@ -125,7 +126,10 @@ class NotificationSerializer(serializers.Serializer):
             return None
 
     def get_notif_page(self, obj):
-        PAGE_TYPES = ("page_follow", "page_follow_request", "page_follow_approved", "page_poster_added")
+        PAGE_TYPES = (
+            "page_follow", "page_follow_request", "page_follow_approved",
+            "page_poster_added", "page_deleted", "page_restored",
+        )
         if obj.notification_type not in PAGE_TYPES or not obj.page_id:
             return None
         request = self.context.get("request")
@@ -134,6 +138,30 @@ class NotificationSerializer(serializers.Serializer):
         if page.avatar:
             avatar_url = request.build_absolute_uri(page.avatar.url) if request else page.avatar.url
         return {"id": page.id, "name": page.name, "avatar": avatar_url}
+
+    def get_media_restorable(self, obj):
+        """For a ``page_restored`` notification: True iff the viewer still has
+        posts from that page sitting in their trash (trashed by the original
+        page deletion) AND the page is currently live — i.e. the "Restore my
+        posts" action is still offerable. Drives whether the row shows the
+        Restore / Keep buttons. None for every other notification type."""
+        if obj.notification_type != "page_restored" or not obj.page_id:
+            return None
+        # Page re-trashed since? Then there's nowhere to restore into.
+        page = obj.page
+        if page is None or page.deleted_at is not None:
+            return False
+        restorable_ids = self.context.get("restorable_media_page_ids")
+        if restorable_ids is not None:
+            return obj.page_id in restorable_ids
+        # Fallback (no batched set in context): one query.
+        from ..models import Post
+        return Post.all_objects.filter(
+            page_id=obj.page_id,
+            user_id=obj.recipient_id,
+            trashed_at__isnull=False,
+            trashed_reason="page_deleted",
+        ).exists()
 
     def get_post(self, obj):
         post = obj.media

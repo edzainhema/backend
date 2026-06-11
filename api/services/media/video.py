@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 def _extract_first_frame_jpeg(video_path):
     """
-    Grab the first frame of `video_path` and return it as a JPEG ContentFile.
+    Grab a frame ~1 second into `video_path` and return it as a JPEG ContentFile.
+    (Seeking 1s in skips the black / fade-in opening frame that frame 0 often
+    caught; the function name is historical.)
 
     Used to derive a video's thumbnail from the *already-processed* clip (the
     one with the colour filter + text overlays baked in), so the thumbnail the
@@ -38,14 +40,17 @@ def _extract_first_frame_jpeg(video_path):
     THUMB_TIMEOUT = 30  # seconds — a single-frame grab is fast; cap defensively
     thumb_path = os.path.splitext(video_path)[0] + '_thumb.jpg'
     try:
-        # -frames:v 1 grabs exactly one frame; -q:v 2 is a high-quality JPEG.
+        # `ss=1` seeks ~1s in before grabbing the frame; -frames:v 1 grabs
+        # exactly one; -q:v 2 is a high-quality JPEG. For a sub-1s clip the seek
+        # lands past the end and ffmpeg produces no output → returns None below
+        # and the caller falls back to the client's (duration-clamped) thumbnail.
         # The processed video is already capped at 720px on its constraining
         # axis (the client compresses to maxSize 720 before upload), so we
         # don't resize here — the frame is already a sensible thumbnail size
         # and matches the video's resolution exactly.
         proc = (
             ffmpeg
-            .input(video_path)
+            .input(video_path, ss=1)
             .output(thumb_path, vframes=1, format='image2', vcodec='mjpeg',
                     **{'q:v': 2}, y=None)
             .run_async(quiet=True, pipe_stdout=True, pipe_stderr=True)

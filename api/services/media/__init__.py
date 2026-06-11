@@ -21,6 +21,8 @@ from .images import (
     process_media_image,
     make_image_thumbnail,
     average_color,
+    crop_to_max_portrait_ratio,
+    MAX_PORTRAIT_RATIO,
     IMAGE_THUMBNAIL_MAX_EDGE,
     IMAGE_THUMBNAIL_QUALITY,
 )
@@ -47,6 +49,8 @@ __all__ = [
     "process_media_image",
     "make_image_thumbnail",
     "average_color",
+    "crop_to_max_portrait_ratio",
+    "MAX_PORTRAIT_RATIO",
     "IMAGE_THUMBNAIL_MAX_EDGE",
     "IMAGE_THUMBNAIL_QUALITY",
     "process_media_video",

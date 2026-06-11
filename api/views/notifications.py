@@ -173,6 +173,22 @@ def list_notifications(request):
         for pfr in PageFollowRequest.objects.filter(page__owner=user)
     }
 
+    # Pages for which this viewer still has page-deletion-trashed posts — the
+    # set that makes a `page_restored` notification's Restore action offerable.
+    # One query instead of one per notification — and only run at all when this
+    # slice actually contains a `page_restored` row (the only type that reads it),
+    # so the common notifications load skips the query entirely.
+    restorable_media_page_ids: set = set()
+    if any(n.notification_type == "page_restored" for n in notif_list):
+        restorable_media_page_ids = set(
+            Post.all_objects.filter(
+                user=user,
+                trashed_at__isnull=False,
+                trashed_reason="page_deleted",
+                page__isnull=False,
+            ).values_list("page_id", flat=True).distinct()
+        )
+
     # --------------------------------------------------
     # SERIALIZE
     # --------------------------------------------------
@@ -182,6 +198,7 @@ def list_notifications(request):
         "page_invite_map":         pi_map,
         "page_invite_page_map":    pi_page_map,
         "page_follow_request_map": pfr_map,
+        "restorable_media_page_ids": restorable_media_page_ids,
     }
     # Pass `notif_list` (the materialised slice) rather than the queryset
     # so the serializer sees the annotated/replaced post objects we attached

@@ -255,6 +255,39 @@ def process_post_media(post_media_id):
 
 
 @shared_task(ignore_result=True)
+def fan_out_post_notifications(post_id, actor_id, description=""):
+    """Create + push the @mention and tag notifications for a new post, off the
+    upload request thread.
+
+    create_post enqueues this AFTER the post + its PostMediaTag rows commit, so
+    the task only reads them and writes Notification rows / enqueues pushes
+    (push_to_user is itself an enqueue wrapper). Moving the per-recipient fan-out
+    here keeps the upload response fast even when a post tags/mentions many
+    people. A post or actor deleted between enqueue and run is a silent no-op.
+
+    Lazy import of the create helpers avoids a circular import (create.py imports
+    this module at load time). In EAGER mode (no broker) this runs inline at the
+    .delay() call, exactly preserving the old synchronous behaviour.
+    """
+    from django.contrib.auth.models import User
+
+    from .models import Post
+    from .views.posts.create import _notify_post_mentions, _notify_post_tags
+
+    try:
+        actor = User.objects.get(id=actor_id)
+    except User.DoesNotExist:
+        return
+    try:
+        post = Post.all_objects.get(id=post_id)
+    except Post.DoesNotExist:
+        return
+
+    _notify_post_mentions(actor, post, description or "")
+    _notify_post_tags(actor, post)
+
+
+@shared_task(ignore_result=True)
 def notify_moderation(
     kind, report_id, target_id, target_label, reason, reporter_username,
     details="",

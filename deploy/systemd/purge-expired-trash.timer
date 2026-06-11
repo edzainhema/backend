@@ -1,0 +1,20 @@
+# systemd timer: fire the trash retention sweep daily. Pairs with
+# purge-expired-trash.service. See that file's header for install steps.
+#
+# Daily is plenty — items only expire on a 90-day boundary, so the exact run
+# time doesn't matter; 03:30 keeps it off peak. Persistent=true makes a missed
+# run (server off / down at 03:30) fire on the next boot, so trash can't pile up
+# unbounded just because the box was asleep. RandomizedDelaySec spreads load if
+# several timers share this slot.
+
+[Unit]
+Description=Daily trash retention sweep (purge >90-day trashed pages/posts)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=purge-expired-trash.service
+
+[Install]
+WantedBy=timers.target

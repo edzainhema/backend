@@ -17,8 +17,8 @@ from rest_framework.response import Response
 
 from ...models import BlockedUser, Follow, Notification, Page, PagePoster, Post, PostMedia, PostMediaTag
 from ...serializers import ProfilePostSerializer
-from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, average_color, make_image_thumbnail, process_media_image, process_media_video, validate_uploaded_media_file, verify_uploaded_media
-from ...tasks import process_post_media
+from ...services.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, average_color, crop_to_max_portrait_ratio, make_image_thumbnail, process_media_image, process_media_video, validate_uploaded_media_file, verify_uploaded_media
+from ...tasks import fan_out_post_notifications, process_post_media
 from ...services.push import push_to_user
 from ...services.hashtags import sync_post_hashtags
 from ...services.throttles import PostCreateRateThrottle
@@ -169,21 +169,48 @@ def _process_media_files(request, files):
         else:
             processed_file = f
 
+        # ── 9:16 max-height crop (image path) ────────────────────────────────
+        # Bake the portrait cap into the stored image: anything taller than 9:16
+        # is center-cropped to exactly 9:16; everything else is returned
+        # unchanged (crop_to_max_portrait_ratio → None ⇒ keep the original
+        # bytes). Done BEFORE dimensions + thumbnail below so width/height and
+        # the grid thumbnail all derive from the already-cropped image.
+        if is_image:
+            cropped_image = crop_to_max_portrait_ratio(processed_file)
+            if cropped_image is not None:
+                processed_file = cropped_image
+
         # Pixel dimensions, read from the exact bytes we're about to store
         # (best-effort; videos and unreadable images come back (None, None)).
         width, height = _image_dimensions(processed_file)
 
-        # PIL can't measure a video, so for videos derive the DISPLAY dimensions
-        # from the thumbnail — the first frame at native resolution, so it
-        # carries the same aspect ratio. Without this the feed has no aspect for
-        # a video post: it renders the tile square (cropping the video) and only
-        # resizes once the player reports its natural size on load — the visible
-        # "shows squished, then resizes, then plays" jump on a feed video.
-        # _image_dimensions reseeks to 0, so the thumbnail is still saveable below.
-        if is_video and (width is None or height is None):
-            vid_thumb = baked_thumbnail or request.FILES.get(f'thumbnail_{idx}')
-            if vid_thumb is not None:
-                width, height = _image_dimensions(vid_thumb)
+        # Client-extracted raw first frame (the unedited-video thumbnail). Read
+        # once here so the crop + dims logic below and the result dict agree on
+        # the same object.
+        client_thumbnail = request.FILES.get(f'thumbnail_{idx}') if is_video else None
+
+        # ── 9:16 max-height crop (video path) ────────────────────────────────
+        # PIL can't measure a video, so the DISPLAY dimensions come from the
+        # thumbnail — and the thumbnail is also the poster shown under the
+        # player. Crop the thumbnail to 9:16 so BOTH the stored dims and the
+        # poster are capped; the HLS pass (build_hls_ladder) bakes the identical
+        # crop into the streamed renditions, and the progressive MP4 fills the
+        # 9:16 box via the player's cover fit. We can't re-encode the (up to
+        # 7-minute) MP4 in the request path, so cropping the thumbnail + dims is
+        # what makes a tall video render at 9:16 everywhere, immediately.
+        # Prefer the baked (filter/overlay-carrying) thumb, else the client's.
+        if is_video:
+            resolved_thumb = baked_thumbnail or client_thumbnail
+            if resolved_thumb is not None:
+                cropped_thumb = crop_to_max_portrait_ratio(resolved_thumb)
+                if cropped_thumb is not None:
+                    resolved_thumb = cropped_thumb
+                width, height = _image_dimensions(resolved_thumb)
+            # Collapse the two thumbnail sources into one resolved (possibly
+            # cropped) object so the save site stores exactly this — not the
+            # uncropped original it would otherwise re-pick.
+            baked_thumbnail = resolved_thumb
+            client_thumbnail = None
 
         # NOTE: HLS packaging for videos is NOT done here anymore. It's the slow
         # part of the pipeline, so it's deferred to the process_post_media
@@ -211,12 +238,12 @@ def _process_media_files(request, files):
             "is_video": is_video,
             "image_thumbnail": image_thumbnail,
             "placeholder_color": placeholder_color,
+            # For videos this is the single resolved (possibly 9:16-cropped)
+            # thumbnail; baked_thumbnail/client_thumbnail were collapsed above.
             "baked_thumbnail": baked_thumbnail,
-            # Client-extracted raw first frame, used as the thumbnail when the
-            # server didn't bake one (unedited video, or extraction failed).
-            "client_thumbnail": (
-                request.FILES.get(f'thumbnail_{idx}') if is_video else None
-            ),
+            # Kept for shape-compatibility with the save site; always None for
+            # video now (folded into baked_thumbnail) and None for images.
+            "client_thumbnail": client_thumbnail,
             "width": width,
             "height": height,
             # Pre-parsed list of user IDs the uploader tagged in THIS media.
@@ -329,13 +356,16 @@ def _validate_per_file_upload(request, files):
     return None
 
 
-def _notify_post_mentions(request, post, description):
+def _notify_post_mentions(actor, post, description):
     """Notify users @mentioned in a post description (best-effort;
-    respects block relationships)."""
+    respects block relationships).
+
+    Takes the ``actor`` (the poster) directly rather than ``request`` so it can
+    run on a worker — it's invoked from the fan_out_post_notifications Celery
+    task, off the upload request thread (see create_post).
+    """
     # --------------------------------------------------
     # 🏷️ @MENTIONS in description (Mentions in posts)
-    # Done outside the atomic block — notifications are best-effort and
-    # we don't want a flaky push to fail the whole upload.
     # --------------------------------------------------
     mentioned_usernames = set(
         re.findall(r"@([A-Za-z0-9_]{1,30})", description or "")
@@ -345,42 +375,43 @@ def _notify_post_mentions(request, post, description):
         # description; case-insensitive lookup so @Alice and @alice match.
         mentioned_users = User.objects.filter(
             username__iregex=r'^(' + '|'.join(re.escape(u) for u in mentioned_usernames) + ')$'
-        ).exclude(id=request.user.id).distinct()
+        ).exclude(id=actor.id).distinct()
 
         for u in mentioned_users:
             # 🚫 BLOCK CHECK
-            if BlockedUser.objects.between(request.user, u).exists():
+            if BlockedUser.objects.between(actor, u).exists():
                 continue
 
             Notification.objects.create(
                 recipient=u,
-                actor=request.user,
+                actor=actor,
                 notification_type="mention",
                 media=post,
             )
             push_to_user(
                 u,
                 title="You were mentioned",
-                body=f"{request.user.username} mentioned you in a post",
+                body=f"{actor.username} mentioned you in a post",
                 extra_data={
                     "type": "mention",
                     "post_id": post.id,
-                    "actor_id": request.user.id,
+                    "actor_id": actor.id,
                 },
             )
 
 
-def _notify_post_tags(request, post):
+def _notify_post_tags(actor, post):
     """Notify every user who got tagged in any of this post's media.
 
     Reads back the PostMediaTag rows created inside the atomic block (so we
     pick up exactly the same set the DB persisted — already de-self-tagged
     and block-filtered there) and dedupes across media: if a user is tagged
     in two photos of the same post, we send exactly one notification + one
-    push, not two. Runs OUTSIDE the atomic block by design — notifications
-    are best-effort and we don't want a flaky FCM call to bubble up and
-    fail an otherwise-successful upload, matching the existing
-    _notify_post_mentions contract.
+    push, not two.
+
+    Takes the ``actor`` (the poster) directly rather than ``request`` so it can
+    run on a worker — invoked from the fan_out_post_notifications Celery task,
+    off the upload request thread (see create_post).
     """
     tagged_users = list(
         User.objects.filter(
@@ -395,7 +426,7 @@ def _notify_post_tags(request, post):
     for u in tagged_users:
         Notification.objects.create(
             recipient=u,
-            actor=request.user,
+            actor=actor,
             notification_type="post_tag",
             media=post,
         )
@@ -407,13 +438,13 @@ def _notify_post_tags(request, post):
         push_to_user(
             u,
             title="You were tagged",
-            body=f"{request.user.username} tagged you in a post",
+            body=f"{actor.username} tagged you in a post",
             extra_data={
                 "type": "post_tag",
                 "post_id": post.id,
-                "actor_id": request.user.id,
+                "actor_id": actor.id,
             },
-            actor=request.user,
+            actor=actor,
             page=post.page,
         )
 
@@ -479,6 +510,39 @@ def create_post(request):
             {'error': 'Failed to create post. Please try again.'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+    # ── Resolve taggable users for ALL media in one pair of queries ────────
+    # Collect every tagged user ID across all media and resolve them ONCE — a
+    # single User lookup + a single BlockedUser lookup — instead of a query
+    # pair per tagged media item (a 10-photo, all-tagged post used to fire ~20
+    # extra queries inside the transaction). Self-tags and users blocked in
+    # either direction are dropped here, leaving `eligible_taggees` (id -> User)
+    # so the per-media loop below is just a dict lookup + bulk insert. Read-only,
+    # so it runs OUTSIDE the transaction, keeping that block to fast writes.
+    all_tagged_ids = {
+        uid
+        for item in processed
+        for uid in (item.get("tagged_user_ids") or [])
+        if uid != request.user.id
+    }
+    eligible_taggees: dict[int, User] = {}
+    if all_tagged_ids:
+        candidates = {
+            u.id: u for u in User.objects.filter(id__in=all_tagged_ids)
+        }
+        if candidates:
+            blocked_ids: set[int] = set()
+            block_pairs = BlockedUser.objects.filter(
+                models.Q(user=request.user, blocked_user_id__in=candidates.keys())
+                | models.Q(user_id__in=candidates.keys(), blocked_user=request.user)
+            ).values_list("user_id", "blocked_user_id")
+            for a, b in block_pairs:
+                blocked_ids.add(a)
+                blocked_ids.add(b)
+            blocked_ids.discard(request.user.id)
+            eligible_taggees = {
+                uid: u for uid, u in candidates.items() if uid not in blocked_ids
+            }
 
     # ── Create rows atomically ─────────────────────────────────────────
     # Post + all its PostMedia rows commit together, fully processed, so no
@@ -587,38 +651,19 @@ def create_post(request):
                 # we just skip anything that doesn't resolve. The
                 # ``unique_together`` on (media, user) makes the create idempotent
                 # under client retries.
+                # Tag resolution + block filtering already happened once for the
+                # whole post (see eligible_taggees above), so this is a pure dict
+                # lookup — no per-media User / BlockedUser queries. The
+                # ``unique_together`` on (media, user) keeps the create idempotent
+                # under client retries.
                 requested_ids = item.get("tagged_user_ids") or []
                 if requested_ids:
-                    eligible_users = list(
-                        User.objects.filter(id__in=requested_ids)
-                        .exclude(id=request.user.id)
-                    )
-                    if eligible_users:
-                        # Honour blocks in EITHER direction. .between() is
-                        # the single-pair shortcut; for a LIST of candidates
-                        # we spell out both directions with __in, mirroring
-                        # the Q-pair pattern .between() uses internally. One
-                        # bulk query, no N+1 across the candidate list.
-                        eligible_ids = [u.id for u in eligible_users]
-                        block_pairs = BlockedUser.objects.filter(
-                            models.Q(
-                                user=request.user,
-                                blocked_user_id__in=eligible_ids,
-                            )
-                            | models.Q(
-                                user_id__in=eligible_ids,
-                                blocked_user=request.user,
-                            )
-                        ).values_list("user_id", "blocked_user_id")
-                        skip_ids = {
-                            other_id
-                            for pair in block_pairs
-                            for other_id in pair
-                            if other_id != request.user.id
-                        }
-                        tagged_users_for_media = [
-                            u for u in eligible_users if u.id not in skip_ids
-                        ]
+                    tagged_users_for_media = [
+                        eligible_taggees[uid]
+                        for uid in requested_ids
+                        if uid in eligible_taggees
+                    ]
+                    if tagged_users_for_media:
                         PostMediaTag.objects.bulk_create(
                             [
                                 PostMediaTag(media=pm, user=u)
@@ -660,8 +705,12 @@ def create_post(request):
         )
 
 
-    _notify_post_mentions(request, post, description)
-    _notify_post_tags(request, post)
+    # Fan out @mention + tag notifications on a worker, off the request thread
+    # (the per-recipient Notification.create writes, block checks, and push
+    # enqueues used to run inline here). The post + its PostMediaTag rows are
+    # committed, so the task just reads them. In EAGER mode (no broker) this runs
+    # inline, exactly preserving the old timing/behaviour.
+    fan_out_post_notifications.delay(post.id, request.user.id, description)
 
     # Invalidate suggested feed caches for all followers so the new post
     # surfaces in their feed immediately rather than waiting for the 5-min TTL.

@@ -183,6 +183,59 @@ def make_image_thumbnail(
             pass
 
 
+# Maximum portrait aspect ratio for stored media: 9:16 (width:height). Media
+# TALLER than this — i.e. height > width * 16/9 — is center-cropped down to
+# exactly 9:16 at upload; square/landscape/shorter-portrait media passes through
+# untouched. Matches the render-time cap in the feed row (MAX_MEDIA_HEIGHT =
+# width * 16/9) and the HLS crop baked in the worker, so a clip is the same shape
+# in storage, in the stream, and on screen.
+MAX_PORTRAIT_RATIO = 16 / 9
+
+
+def crop_to_max_portrait_ratio(input_file, max_ratio=MAX_PORTRAIT_RATIO):
+    """Center-crop an image's top+bottom so it is no taller than ``max_ratio``
+    (height / width). Returns a JPEG ``ContentFile`` of the cropped image, or
+    ``None`` when no crop was needed (already within the cap) OR on any failure
+    — in both cases the caller keeps the original bytes unchanged.
+
+    EXIF orientation is baked into the pixels first (``exif_transpose``) so the
+    crop is taken against the image as it actually displays — otherwise a
+    portrait photo stored as landscape-pixels + a rotate tag would be cropped on
+    the wrong axis. Seek-safe: the read cursor is reset on the way out so the
+    SAME object can still be measured / stored afterwards (mirrors
+    ``make_image_thumbnail`` / ``average_color``).
+    """
+    try:
+        input_file.seek(0)
+        with Image.open(input_file) as img:
+            img = ImageOps.exif_transpose(img)
+            w, h = img.size
+            if w <= 0 or h <= 0:
+                return None
+            max_h = int(round(w * max_ratio))
+            # Keep the crop height even — libx264/yuv420p (and our video path)
+            # want even dims, and it costs nothing for stills to match.
+            max_h -= max_h % 2
+            if max_h <= 0 or h <= max_h:
+                return None  # already within the 9:16 cap → no crop
+            top = (h - max_h) // 2
+            img = img.convert("RGB").crop((0, top, w, top + max_h))
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG", quality=92)
+            buffer.seek(0)
+            return ContentFile(
+                buffer.getvalue(),
+                name=getattr(input_file, "name", None) or "crop.jpg",
+            )
+    except Exception:
+        return None
+    finally:
+        try:
+            input_file.seek(0)
+        except Exception:
+            pass
+
+
 def average_color(input_file):
     """Return the image's average colour as a hex string ("#rrggbb"), or None.
 

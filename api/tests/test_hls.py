@@ -66,4 +66,8 @@ class FfmpegArgsTests(SimpleTestCase):
     def test_var_stream_map_matches_audio_flag(self):
         args = build_hls_ffmpeg_args("in.mp4", "/out", has_audio=False)
         idx = args.index("-var_stream_map")
-        self.assertEqual(args[idx + 1], "v:0 v:1 v:2")
+        # Derive the expected map from the ladder so this stays correct if the
+        # rung count changes (it was hard-coded to 3 and went stale when the
+        # 540p rung was dropped, leaving a two-rung 360/720 ladder).
+        expected = " ".join(f"v:{i}" for i in range(len(HLS_LADDER)))
+        self.assertEqual(args[idx + 1], expected)

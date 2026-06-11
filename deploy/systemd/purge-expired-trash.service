@@ -1,0 +1,34 @@
+# systemd service: run the trash retention sweep once (oneshot, driven by the
+# paired .timer). Permanently deletes trashed pages/posts older than 90 days
+# (api/management/commands/purge_expired_trash.py) and reclaims their storage.
+#
+# Install (as root on the server):
+#   cp backend/deploy/systemd/purge-expired-trash.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now purge-expired-trash.timer
+# Check:
+#   systemctl list-timers purge-expired-trash.timer
+#   systemctl start purge-expired-trash.service   # run once, on demand
+#   journalctl -u purge-expired-trash.service
+#
+# Adjust User / WorkingDirectory / EnvironmentFile / the python path to match
+# your deployment (they should mirror your other backend units, e.g. the app /
+# celery services). The command needs the same env (DATABASE_URL, REDIS_URL,
+# storage creds, …) the app runs with — that's what EnvironmentFile supplies.
+
+[Unit]
+Description=Purge expired (>90 day) trashed pages and posts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+WorkingDirectory=/srv/here/backend
+EnvironmentFile=/srv/here/backend/.env
+ExecStart=/srv/here/backend/venv/bin/python manage.py purge_expired_trash
+# A sweep that deletes a large backlog (plus storage calls) shouldn't run
+# unbounded; cap it generously.
+TimeoutStartSec=1800
+Nice=10

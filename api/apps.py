@@ -43,6 +43,25 @@ class ApiConfig(AppConfig):
             dispatch_uid="invalidate_unread_count_on_notification_delete",
         )
 
+        # When a user is deleted (admin, a future delete-account endpoint, a data
+        # script), tear down their LIVE owned pages first: trash the posts on
+        # them so contributors' posts don't orphan into page-less live posts when
+        # the page rows cascade-delete with the user (Post.page is SET_NULL).
+        # Also cleans up the departing user's own post files. Lives on pre_delete
+        # so it always runs, no matter the deletion path.
+        from django.db.models.signals import pre_delete
+        from django.contrib.auth.models import User as AuthUser
+
+        def _teardown_user_pages_on_delete(sender, instance, **kwargs):
+            from .services.page_teardown import teardown_user_owned_pages
+            teardown_user_owned_pages(instance)
+
+        pre_delete.connect(
+            _teardown_user_pages_on_delete,
+            sender=AuthUser,
+            dispatch_uid="teardown_user_owned_pages_on_delete",
+        )
+
         # Pin Pillow's decompression-bomb ceiling process-wide at startup. The
         # authoritative value and full rationale live in the upload validator
         # (services/media/validation.py), which also applies it at its own

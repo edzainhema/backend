@@ -13,6 +13,17 @@ from django.contrib.auth.models import User
 from .moderation import ReportTriage
 
 
+class PageManager(models.Manager):
+    """Default manager that hides trashed (soft-deleted) pages — those with a
+    non-null ``deleted_at``. Every ``Page.objects`` query (detail, my-pages,
+    lists, search, follow/pin/mute, …) therefore skips trashed pages
+    automatically. Use ``Page.all_objects`` to reach trashed rows (restore /
+    admin / storage cleanup)."""
+
+    def get_queryset(self):
+        return super().get_queryset().filter(deleted_at__isnull=True)
+
+
 class Page(models.Model):
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='owned_pages')
     name = models.CharField(max_length=100)
@@ -46,6 +57,22 @@ class Page(models.Model):
 
     # When True, the page exposes a group chat to all followers.
     chat_enabled = models.BooleanField(default=False)
+
+    # Soft delete ("move to trash"). Null = live; non-null = the timestamp the
+    # owner trashed it. Trashed pages are hidden by the default `objects`
+    # manager (and their posts are hidden via Post's manager), but the row +
+    # all its content are preserved so the page can be restored.
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # `objects` hides trashed pages; `all_objects` sees everything.
+    objects = PageManager()
+    all_objects = models.Manager()
+
+    class Meta:
+        # Related-object access (post.page, notification.page, follow.page, …)
+        # must resolve even when the page is trashed, so FK traversal uses the
+        # unfiltered manager rather than the trashed-hiding default.
+        base_manager_name = "all_objects"
 
     def __str__(self):
         return f"{self.name} by {self.owner}"

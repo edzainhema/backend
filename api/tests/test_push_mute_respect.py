@@ -186,13 +186,11 @@ class PostTagPushMuteIntegrationTests(APITestCase):
         PostMediaTag.objects.create(media=self.media, user=self.tagged)
 
     def _trigger_notify(self):
-        """Drive `_notify_post_tags` with a fake request object that
-        has `.user = self.poster`. The helper only reads `request.user`,
-        so a stub is enough."""
+        """Drive `_notify_post_tags` directly. It now takes the actor (the
+        poster) rather than a request, so it can run on a worker — see the
+        fan_out_post_notifications task."""
         from api.views.posts.create import _notify_post_tags
-        class _Stub:
-            user = self.poster
-        _notify_post_tags(_Stub(), self.post)
+        _notify_post_tags(self.poster, self.post)
 
     def test_post_tag_push_skipped_when_tagged_muted_poster(self):
         MutedUser.objects.create(user=self.tagged, muted_user=self.poster)

@@ -56,6 +56,45 @@ def home_feed(request):
     return Response(payload)
 
 
+def _interleave_checkerboard(videos, images, columns=2):
+    """Arrange two rank-ordered streams into a ``columns``-wide checkerboard.
+
+    A tile at flat index ``i`` (row = i // columns, col = i % columns) is taken
+    from ``videos`` when ``(row + col)`` is even and from ``images`` when it is
+    odd — so index 0 (top-left) is a video and the two media types alternate
+    both across each row and down each column. As soon as EITHER stream is
+    exhausted, the checkerboard stops and every remaining item (from whichever
+    stream still has items) is appended in its existing rank order, so no
+    content is ever dropped. Inputs/outputs are lists of ``(post_id, score)``
+    pairs; the relative rank order WITHIN each media type is preserved.
+    """
+    vi = iter(videos)
+    ii = iter(images)
+    v_next = next(vi, None)
+    i_next = next(ii, None)
+    arranged = []
+    pos = 0
+    while v_next is not None and i_next is not None:
+        col = pos % columns
+        row = pos // columns
+        if (row + col) % 2 == 0:
+            arranged.append(v_next)
+            v_next = next(vi, None)
+        else:
+            arranged.append(i_next)
+            i_next = next(ii, None)
+        pos += 1
+    # One stream ran dry — append the rest in rank order (decision: append, not
+    # stop, so the user still sees every item once the pattern can't hold).
+    if v_next is not None:
+        arranged.append(v_next)
+        arranged.extend(vi)
+    if i_next is not None:
+        arranged.append(i_next)
+        arranged.extend(ii)
+    return arranged
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def explore_feed(request):
@@ -155,7 +194,33 @@ def explore_feed(request):
             scored.append((c["id"], score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        scored_ids = scored[:PAGE_SIZE]
+        top_scored = scored[:PAGE_SIZE]
+
+        # Arrange the ranked slice into a 2-column video/image checkerboard
+        # (video anchored top-left) so the explore grid alternates media types
+        # across columns AND down rows. Classify each post as a single video
+        # (the only tiles that read as "video" — multi-media and single images
+        # both count as image tiles), then interleave the two rank-ordered
+        # streams. Done ONCE here and cached, so the pattern stays consistent
+        # across paginated requests (each page is just a slice of this order).
+        top_ids = [pid for pid, _ in top_scored]
+        media_files_by_post = defaultdict(list)
+        for m_post_id, m_file in (
+            PostMedia.objects
+            .filter(post_id__in=top_ids)
+            .values_list("post_id", "file")
+        ):
+            media_files_by_post[m_post_id].append(m_file)
+
+        def _is_single_video(post_id):
+            files = media_files_by_post.get(post_id, [])
+            if len(files) != 1:
+                return False
+            return (files[0] or "").lower().endswith((".mp4", ".mov", ".webm"))
+
+        videos = [pair for pair in top_scored if _is_single_video(pair[0])]
+        images = [pair for pair in top_scored if not _is_single_video(pair[0])]
+        scored_ids = _interleave_checkerboard(videos, images)
         cache.set(cache_key, scored_ids, timeout=EXPLORE_TTL_S)
 
     if not scored_ids:

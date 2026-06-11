@@ -2,8 +2,10 @@
 
 
 from django.core.cache import cache
+from django.db import transaction
 from django.db.models import Exists, F, OuterRef, Prefetch, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
@@ -16,6 +18,8 @@ from ...services.feed_helpers import (
     likes_count_subquery, comments_count_subquery, saves_count_subquery,
 )
 from ...services.media import safe_image_filename, validate_image_upload
+from ...services.page_teardown import notify_page_restored, teardown_page
+from ...services.post_cleanup import purge_post_files
 from ...services.push import push_to_user
 from ...services.throttles import FollowRateThrottle
 
@@ -47,6 +51,51 @@ def create_page(request):
         },
         status=status.HTTP_201_CREATED
     )
+
+
+@api_view(['POST', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_page(request):
+    """Move a page the requester owns to trash (soft delete).
+
+    Owner-only. Instead of destroying anything, we stamp ``deleted_at`` on the
+    page. The default ``Page.objects`` / ``Post.objects`` managers then hide the
+    page AND all of its posts from every surface (detail 404s, it drops out of
+    my-pages / lists / search / feeds / profile grids), but the row and all its
+    content are preserved so the page can be restored later. Nothing is deleted
+    from storage either. (``Page.all_objects`` reaches trashed rows.)
+
+    ``get_object_or_404(Page, …)`` goes through the trash-hiding manager, so an
+    already-trashed page 404s here — you can't re-trash it.
+    """
+    page_id = request.data.get('page_id') or request.query_params.get('page_id')
+    try:
+        pid = int(page_id)
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "page_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    page = get_object_or_404(Page, id=pid)
+
+    # Only the owner can delete a page. Everyone else (followers, allowed
+    # posters, random viewers) gets a 403 — never a silent no-op.
+    if page.owner_id != request.user.id:
+        return Response(
+            {"error": "Only the page owner can delete this page."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    # Trash the page AND cascade into its posts atomically: every still-live
+    # post on the page moves into its author's trash (reason "page_deleted") and
+    # each contributor (except the admin) is notified. Shared teardown path so
+    # account deletion (Phase 6) can reuse it instead of a raw cascade.
+    with transaction.atomic():
+        page.deleted_at = timezone.now()
+        page.save(update_fields=["deleted_at"])
+        teardown_page(page, actor=request.user)
+    return Response({"status": "trashed"}, status=status.HTTP_200_OK)
 
 
 
@@ -507,6 +556,164 @@ def list_my_pages(request):
 
     return Response({"results": results, "has_more": has_more})
 
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_trashed_pages(request):
+    """Pages the viewer has trashed (owner == viewer, ``deleted_at`` set), most
+    recently trashed first. Backs Profile → Trash. Uses ``Page.all_objects``
+    because the default manager hides trashed rows. Avatars are absolute URLs."""
+    viewer = request.user
+    pages = (
+        Page.all_objects
+        .filter(owner=viewer, deleted_at__isnull=False)
+        .order_by("-deleted_at", "-id")
+    )
+    results = [
+        {
+            "id": page.id,
+            "name": page.name,
+            "avatar": request.build_absolute_uri(page.avatar.url) if page.avatar else None,
+            "is_private": page.is_private,
+            "is_super_private": page.is_super_private,
+            "deleted_at": page.deleted_at.isoformat() if page.deleted_at else None,
+        }
+        for page in pages
+    ]
+    return Response({"results": results})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def restore_page(request):
+    """Restore a trashed page (owner-only): clear ``deleted_at`` so the page
+    becomes visible again.
+
+    With ``restore_own_media`` truthy, ALSO restore the owner's *own* posts that
+    were trashed BY this page's deletion (``trashed_reason="page_deleted"``) back
+    into the page. Other contributors' posts stay in their trash — they get the
+    interactive restore prompt in Phase 5, not an automatic restore here.
+    """
+    page_id = request.data.get("page_id")
+    restore_own_media = request.data.get("restore_own_media") in (True, "true", "True", 1, "1")
+    try:
+        pid = int(page_id)
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "page_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    # all_objects so we can reach the trashed row (the default manager hides it).
+    page = get_object_or_404(Page.all_objects, id=pid)
+    if page.owner_id != request.user.id:
+        return Response(
+            {"error": "Only the page owner can restore this page."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    was_trashed = page.deleted_at is not None
+    with transaction.atomic():
+        if was_trashed:
+            page.deleted_at = None
+            page.save(update_fields=["deleted_at"])
+        if restore_own_media:
+            # Only the owner's posts that went to trash BECAUSE of this deletion
+            # — not ones they'd personally deleted earlier. They keep page_id, so
+            # clearing the trash flags re-attaches them to the now-live page.
+            Post.all_objects.filter(
+                page=page,
+                user=request.user,
+                trashed_at__isnull=False,
+                trashed_reason="page_deleted",
+            ).update(trashed_at=None, trashed_reason="")
+        if was_trashed:
+            # Offer every OTHER contributor an interactive restore of their own
+            # posts (Phase 5). Runs after restore_own_media so the admin's own
+            # posts are already out of the page_deleted set.
+            notify_page_restored(page, actor=request.user)
+    return Response({"status": "restored"}, status=status.HTTP_200_OK)
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def purge_page(request):
+    """Permanently delete a TRASHED page (owner-only). Only operates on pages
+    already in the trash; a live page must be trashed first.
+
+    Deleting the page row does NOT touch its posts — ``SET_NULL`` just detaches
+    survivors, leaving every contributor's trashed posts (including the owner's)
+    in their own trash. With ``purge_own_media`` truthy, the owner additionally
+    permanently deletes their OWN trashed posts from this page (files and all),
+    BEFORE the page row goes (after that, SET_NULL would sever the page link).
+    Other contributors' posts are never affected either way.
+    """
+    page_id = request.data.get("page_id") or request.query_params.get("page_id")
+    purge_own_media = request.data.get("purge_own_media") in (True, "true", "True", 1, "1")
+    try:
+        pid = int(page_id)
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "page_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    page = get_object_or_404(Page.all_objects, id=pid)
+    if page.owner_id != request.user.id:
+        return Response(
+            {"error": "Only the page owner can delete this page."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if page.deleted_at is None:
+        return Response(
+            {"error": "Page must be in the trash before it can be permanently deleted."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        if purge_own_media:
+            own = Post.all_objects.filter(
+                page=page, user=request.user, trashed_at__isnull=False
+            )
+            for p in own:
+                purge_post_files(p)
+            own.delete()
+        page.delete()
+    return Response({"status": "purged"}, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def restore_my_page_media(request):
+    """A contributor restores THEIR posts — the ones trashed when this page was
+    deleted — back into the now-restored page. Triggered by the "Restore" action
+    on a ``page_restored`` notification.
+
+    The page must be live (a re-trashed page 404s via the default manager).
+    Re-attaches the viewer's ``page_deleted`` posts for that page (they kept
+    ``page_id``) and resolves the prompt by marking their ``page_restored``
+    notifications for it read.
+    """
+    page_id = request.data.get("page_id")
+    try:
+        pid = int(page_id)
+    except (TypeError, ValueError):
+        return Response({"error": "page_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    page = get_object_or_404(Page, id=pid)
+
+    with transaction.atomic():
+        restored = Post.all_objects.filter(
+            page=page,
+            user=request.user,
+            trashed_at__isnull=False,
+            trashed_reason="page_deleted",
+        ).update(trashed_at=None, trashed_reason="")
+        Notification.objects.filter(
+            recipient=request.user,
+            notification_type="page_restored",
+            page=page,
+        ).update(is_read=True)
+
+    return Response({"status": "restored", "count": restored}, status=status.HTTP_200_OK)
 
 
 @api_view(["POST"])
